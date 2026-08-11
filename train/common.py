@@ -38,7 +38,8 @@ def add_common_args(parser: argparse.ArgumentParser):
                         help="数据目录（data_prep/output）")
     parser.add_argument("--output_dir", type=str, required=True,
                         help="checkpoint 输出目录")
-    parser.add_argument("--max_len", type=int, default=1024)
+    parser.add_argument("--max_len", type=int, default=2048,
+                        help="最大序列长度：4bit 下 T4 可支持 2048（覆盖论文 2000 字符序列，避免截断）")
     parser.add_argument("--per_device_batch", type=int, default=4)
     parser.add_argument("--grad_accum", type=int, default=4)
     parser.add_argument("--lr", type=float, default=2e-4)

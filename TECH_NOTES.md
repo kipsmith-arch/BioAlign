@@ -74,11 +74,12 @@ A: r × d_in，B: d_out × r   → 新增参数 = r × (d_in + d_out)
 - max_len 2048→1024、batch 4→2：激活 ∝ batch×seq，约降到 1/4（线性关系）
 - grad checkpoint：激活再降一个量级
 
-### 1.6 本项目 Stage 1 的显存预算结论
+### 1.6 本项目 Stage 1 的显存预算结论（T4 单卡 14.56GB 实测）
 
 ```
-bf16 3B：权重 6.1 + 激活 2-4（checkpoint 后）+ 8bit 优化器 ~0.3 + 梯度 0.4 ≈ 9-11GB（15GB 内 ✅）
-4bit QLoRA 备选：权重 ~2GB，进一步降 4GB
+4bit QLoRA：权重 ~2GB + 激活/优化器 → 峰值 ~5-6GB → 单卡可跑 ✅（Stage 1 定稿）
+bf16 3B：单卡加载后 11.95GB、训练峰值 13GB+ → 单卡/DDP 双卡均装不下 ❌
+（DDP 每卡完整副本、固定开销不摊薄——bf16 双卡同样 ~13.5GB/卡，仍超限）
 ```
 
 ---
@@ -91,7 +92,8 @@ bf16 3B：权重 6.1 + 激活 2-4（checkpoint 后）+ 8bit 优化器 ~0.3 + 梯
 ### 2.2 数据并行 vs 模型并行
 - 显存装得下 → **数据并行（DDP）**：每卡完整模型副本、各看不同 batch，吞吐 ×N，每步一次梯度 all-reduce
 - 显存装不下 → **模型并行**：模型拆开（TP 张量切分 / PP 流水线 / ZeRO 分片）
-- 本项目 3B+4bit 单卡 16GB 绰绰有余 → 双卡 DDP，代码零改动（LOCAL_RANK 决定 device_map），仅改启动命令 + grad_accum 减半
+- **DDP 不减每卡显存**（每卡完整副本，固定开销不摊薄）——只有模型并行/ZeRO 才减单卡显存。**实测教训**：3B bf16 单卡加载后 11.95GB，DDP 双卡每卡同样 11.95GB，训练峰值仍超 14.56GB → bf16 在 T4 上双卡也救不了，只能 4bit
+- 本项目 3B+4bit 单卡 16GB 绰绰有余 → **双卡 DDP 用于提速**（Kaggle 实测双卡扣 1h/1h，白赚速度），代码零改动（LOCAL_RANK 决定 device_map），仅改启动命令 + grad_accum 减半
 
 ### 2.3 数据量充分性：没有先验量化依据（data_prep/README.md 面试问答）
 - "token 数 > 参数数 所以够"的论据**不成立**（与 Chinchilla 方向相反，且 Chinchilla 仅适用于从零预训练）
@@ -121,3 +123,7 @@ for n, p in model.named_parameters():
 - **默认 collator 不 padding**：长度不一的样本必须显式传 `DataCollatorForSeq2Seq`（labels 用 `label_pad_token_id=-100`），否则 batch 拼不齐报维度错误
 - **新版 transformers 属性名变化**：`is_gradient_checkpointing`（旧版 `gradient_checkpointing`）——诊断代码要兼容两者
 - `Dataset.from_list` 不接受 generator（需转 list）；新版 transformers `compute_loss` 签名多了 `num_items_in_batch`——这些属 API 版本变化，踩坑记录留在 train/README。
+
+### 2.8 max_len 的两层语义 + DeepSpeed ZeRO（显存主题延伸）
+- **max_len 语义**：Stage 1 packing 下是**块大小**（不截断，仅丢弃尾部碎片，块越小碎片比例越低）；Stage 2/DPO 下是**序列长度上限**（超长样本尾部会被截断）。生物长序列任务中"序列完整性"优先 → 4bit 省出的显存应让给 max_len（本项目 1024→2048）
+- **DeepSpeed ZeRO**：分片训练状态消除冗余（ZeRO-1 优化器 / ZeRO-2 +梯度 / ZeRO-3 +参数，通信开销递增）。对 3B：优化器+梯度合计仅 ~1.3GB，ZeRO-2 双卡省 ~0.6GB/卡——救不了 bf16（需省 4-6GB）；ZeRO-3 分片参数可省 ~3GB 但通信大、与 4bit 组合复杂，对 3B 不值得

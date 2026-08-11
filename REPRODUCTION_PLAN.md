@@ -1,7 +1,7 @@
 # 三段式后训练流水线方案（Kaggle T4×2 + Qwen2.5-3B）—— 与实现对齐版
 
 > 目标：在 Kaggle 免费资源（T4 16GB，每周约 30h GPU 配额）上用 **Qwen2.5-3B-Instruct** 跑通完整后训练流水线：
-> **① 领域继续预训练（bf16 LoRA+，生物序列）→ ② PEFT（4-bit QLoRA SFT，Biology-Instructions）→ ③ RL（DPO 偏好对齐，自实现 loss）**
+> **① 领域继续预训练（4-bit QLoRA，生物序列）→ ② PEFT（4-bit QLoRA SFT，Biology-Instructions）→ ③ RL（DPO 偏好对齐，自实现 loss）**
 >
 > 技术栈：**transformers + peft + bitsandbytes**（QLoRA）+ **自实现 DPO loss**（不依赖 trl，规避版本兼容问题）。
 > 代码在 `train/`（本地冒烟已通过），数据在 `data_prep/`（01~05 脚本 + 产出）。
@@ -13,7 +13,7 @@
 
 | 项 | 值 |
 |---|---|
-| GPU | Kaggle 免费：**T4 ×2**（16GB×2），每周 GPU 配额 30h（墙钟，**先实测双卡是否翻倍扣配额**）、TPU 20h（不用） |
+| GPU | Kaggle 免费：**T4 ×2**（16GB×2），每周 GPU 配额 30h（墙钟，**已实测：双卡扣 1h/1h，白赚速度**）、TPU 20h（不用） |
 | 运行模式 | 前台交互=调试/冒烟；**Save Version（Commit）=正式长训练**（后台运行，12h/次限制） |
 | 会话/作业 | 单 notebook 12h → **每 stage 一个 notebook** + checkpoint 断点续跑 |
 | 框架 | `transformers` + `peft` + `bitsandbytes`（QLoRA）+ `torch`（原生 Trainer + 自实现 DPO） |
@@ -45,7 +45,7 @@ dataset/ + seq/（原始数据）
 
 | Stage | 代码 | 数据 | 方法 | 关键参数 |
 |---|---|---|---|---|
-| 1 继续预训练 | `stage1_pretrain.py` | stage1_pretrain.jsonl（23.6万） | **bf16 LoRA+**（B lr=A×4）+ packing + 训 RMSNorm | r=64, lr=1e-4, max_len=1024, 8bit AdamW |
+| 1 继续预训练 | `stage1_pretrain.py` | stage1_pretrain.jsonl（23.6万） | **4-bit QLoRA + LoRA+**（B lr=A×4）+ packing + 训 RMSNorm | r=64, lr=1e-4, **max_len=2048**, 8bit AdamW, batch 1 |
 | 2 SFT | `stage2_sft.py` | train_pool_clean.jsonl（28.98万） | 4-bit QLoRA，assistant-only loss | r=16, lr=1e-4~2e-4, max_len=1024 |
 | 偏好构造 | `build_preference.py` | dpo_source（取 2-3 万） | chosen=标准答案 / rejected=基座生成（temp=0.9） | max_new_tokens=96 |
 | 3 DPO | `stage3_dpo.py` | dpo_pairs.jsonl | **自实现 DPO loss**（-log σ(β·Δlogratio)），π_ref=stage2 冻结 | β=0.1, lr=1e-5, 1 epoch |
@@ -75,7 +75,7 @@ CODE_DIR = /kaggle/input/bioalign-code/train      # 代码 Dataset 挂载点（�
 ```
 ① !pip install -q transformers peft bitsandbytes accelerate datasets sentencepiece
 ② 4bit 加载冒烟：3B 模型 load + 1 次 forward（验证 bitsandbytes/CUDA 兼容）
-③ 配额实测：跑 1h 小训练 → GPU 配额扣 1h 还是 2h → 决定双卡 DDP 或单卡
+③ 配额实测：✅ 已确认双卡扣 1h/1h → 全流程使用双卡 DDP（torchrun）
 ④ 验证数据挂载路径（$DATA_DIR 下能看到各 jsonl）
 ```
 
@@ -99,25 +99,25 @@ DPO:     python $CODE_DIR/stage3_dpo.py --model_path $MODEL_3B --stage2_dir /kag
 ```
 
 通过标准：五步无报错、loss 正常下降、输出格式正确 → 环境一致确认。
+**加一步双卡验证**：用 `torchrun --nproc_per_node=2` 跑 Stage1 30 步，确认 DDP 工作（NCCL 初始化、数据 sharding）→ 通过后正式训练全部双卡。
 
 ### 第 3 个 notebook：Stage 1 继续预训练（Commit，3-6h）
 
 ### 第 3 个 notebook：Stage 1 继续预训练（Commit，3-6h）
 
-显存预算（T4 ~15GB）：bf16 3B 权重 6GB + 激活（grad checkpoint 后 ~2-4GB）+ 8bit 优化器 →
-**max_len 用 1024**（≈论文 2000 字符/1200 token 的合理近似），batch=2，8bit AdamW（默认）：
+**最终显存策略（三次 OOM 收敛）**：bf16 3B 单卡/DDP 均装不下（加载后 11.94GB）→
+**4bit QLoRA 定稿**，并把省下的显存让给 **max_len=2048**（覆盖论文 2000 字符序列，几乎零截断）：
 
 ```
 python $CODE_DIR/stage1_pretrain.py \
   --model_path $MODEL_3B \
   --data_dir $DATA_DIR \
   --output_dir /kaggle/working/ckpt/stage1 \
-  --max_len 1024 --per_device_batch 2 --grad_accum 8 --lr 1e-4 \
+  --max_len 2048 --per_device_batch 1 --grad_accum 8 --lr 1e-4 \
   --epochs 1 --lora_plus_scaler 4
 ```
-（--optim 默认 adamw8bit；gradient checkpointing 已在脚本内显式开启；
-双卡 DDP 时 batch 减半、显存压力更小）
-✅ 产出 `ckpt/stage1`（bf16 LoRA+ adapter）→ **立即下载**
+（默认 use_4bit=True + optim=adamw8bit + grad checkpoint；双卡 torchrun + grad_accum 减半）
+✅ 产出 `ckpt/stage1`（4bit QLoRA adapter）→ **立即下载**
 
 ### 第 4 个 notebook：Stage 2 ×2 分支（Commit ×2，各 2-4h）
 
@@ -185,14 +185,14 @@ stage3:   python $CODE_DIR/infer_eval.py --model_path $MODEL_3B --data_dir $DATA
 
 1. commit 失败/超时会清空 working → 每个 commit 完成后**立即下载 checkpoint**；下一个 notebook 把上一个 checkpoint 作为 input 挂载
 2. Stage 2 两分支统一 r=64，消融①只差"有无 Stage 1"
-3. 双卡命令加 `torchrun --nproc_per_node=2`，grad_accum 减半（待配额实测后定）
+3. 双卡命令加 `torchrun --nproc_per_node=2`，grad_accum 减半（已实测配额扣 1h/1h，全流程双卡）
 
 ## 5. 时间预算（T4×2，3B）
 
 | 环节 | 时间 | 运行方式 |
 |---|---|---|
-| 环境验证 + 配额实测 | 1h | 前台 |
-| 全链路冒烟 | 1-1.5h | 前台 |
+| 环境验证 + 配额实测 | 1h | 前台（✅ 已确认双卡扣 1h） |
+| 全链路冒烟（含 torchrun 双卡验证） | 1-1.5h | 前台 |
 | Stage 1（23.6万×1 epoch，bf16 LoRA+） | 3-6h | commit |
 | Stage 2（28.98万×1 epoch，QLoRA）×2 分支 | 4-8h | commit×2 |
 | build_preference（2.5万对，基座生成） | 1-2h | commit |
@@ -212,7 +212,7 @@ stage3:   python $CODE_DIR/infer_eval.py --model_path $MODEL_3B --data_dir $DATA
 
 | 风险 | 对策 |
 |---|---|
-| T4×2 双卡扣费规则不确定 | 第一 notebook 实测 1h 扣 1h 还是 2h |
+| T4×2 双卡扣费规则 | ✅ 已实测：扣 1h/1h → 全流程双卡 DDP |
 | bitsandbytes 与 CUDA 不匹配 | 装完先 4bit 加载冒烟 |
 | Stage 1 欠拟合（loss 不降） | 加数据（GRCh38/RNAcentral 池还有余量）/加大 rank |
 | bf16 3B Stage 1 显存（OOM 实测） | 已修复：8bit AdamW + grad checkpoint + max_len 1024（见 train/README 问题 6）；备选 --use_4bit |
@@ -224,7 +224,7 @@ stage3:   python $CODE_DIR/infer_eval.py --model_path $MODEL_3B --data_dir $DATA
 ## 8. 执行清单（对应第 4 节 notebook 步骤）
 
 - [ ] 上传 `data_prep/output/` 与 `train/` 为 Kaggle Dataset
-- [ ] nb1：环境验证 + 配额实测（4bit 加载冒烟、双卡扣费规则）
+- [ ] nb1：环境验证（✅ 配额已实测扣 1h）
 - [ ] nb2：前台全链路冒烟（smoke.jsonl 五步跑通）
 - [ ] nb3：Stage 1 commit → 下载 ckpt/stage1
 - [ ] nb4：Stage 2 两分支 commit（stage2-only / stage1+stage2）→ 下载两个 adapter

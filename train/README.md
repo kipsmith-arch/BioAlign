@@ -31,11 +31,12 @@
 3. trl 0.29 与 torch 2.5 不兼容（FSDPModule）→ **自实现 DPO loss**（不依赖 trl）
 4. peft 0.18 `from_pretrained` 后 LoRA 参数 requires_grad=False → 显式启用
 5. 新版 transformers `compute_loss` 需 `num_items_in_batch` 参数
-6. **3B Stage 1 OOM（Kaggle 实测，两次）**：
-   - 第一次：bf16 3B + max_len 2048 + fp32 AdamW 超预算 → 8bit AdamW + grad checkpoint + max_len 1024（部分缓解）
-   - 第二次（max_len 1024 仍 OOM）：根因是 **loss 计算的 logits 峰值**——cross-entropy 把 logits 转 fp32，张量 ≈ batch×seq×vocab×4B（batch4×1024×151936×4B≈2.49GB），加上权重 6.1GB 后超预算 → **per_device_batch 4→1**（峰值 2.49→0.6GB）+ grad_accum 补 global batch
-   - 附带发现：新版 transformers 属性名 `is_gradient_checkpointing`（非 `gradient_checkpointing`）；3B 实测 trainable=3.74%（0.5B 的 6.66% 外推偏高，跨规模外推不可靠）
-   - 当前配置：8bit AdamW + grad checkpoint + max_len 1024 + batch 1 → 预算 ~8-9GB
+6. **3B Stage 1 OOM（Kaggle 实测，三次收敛）**：
+   - ① max_len 2048 + fp32 AdamW：超预算 → 8bit AdamW + grad checkpoint + max_len 1024
+   - ② max_len 1024 仍 OOM：根因是 loss 的 logits 峰值（batch×seq×vocab×4B）→ batch 4→1
+   - ③ batch 1 仍 OOM：**根因是 bf16 权重本身**——加载后已用 11.95GB（权重 6.4GB + 预留），训练峰值 13.13GB，单卡 14.56GB 装不下 → **Stage 1 默认改用 4bit QLoRA**（权重 ~2GB，峰值 ~5-6GB）；bf16 仅适合双卡 DDP
+   - 附带：3B 实测 trainable=3.74%（外推 6.66% 不可靠）；属性名 `is_gradient_checkpointing`
+   - 当前配置：**4bit QLoRA + 8bit AdamW + grad checkpoint + max_len 2048 + batch 1**（4bit 省下的显存让给序列长度，几乎零截断；bf16 彻底放弃）
 
 ## 本地冒烟完整命令（0.5B）
 
@@ -84,7 +85,7 @@ python -X utf8 train/infer_eval.py \
 1. 模型路径：`/kaggle/input/models/qwen-lm/qwen2.5/transformers/3b-instruct/1`
 2. 数据上传：`data_prep/output/` 全部上传为 Kaggle Dataset，`--data_dir` 指向挂载路径
 3. 双卡：`torchrun --nproc_per_node=2 train/stage2_sft.py ... --grad_accum <单卡的一半>`
-4. **Stage 1 用 bf16 LoRA+**（rank 64，**max_len 1024**——T4 显存约束下的合理近似，8bit AdamW + grad checkpoint）；Stage 2/3 用 4bit QLoRA
+4. **Stage 1 用 4bit QLoRA + LoRA+**（rank 64，**max_len 2048**——覆盖论文 2000 字符序列几乎零截断）；Stage 2/3 用 4bit QLoRA；bf16 在 T4 上已实测装不下（单卡/DDP 均 OOM）
 5. 消融①需要两个 Stage 2 分支：`--model_path 基座`（stage2-only）vs `--model_path <stage1 产物>`
 6. DPO 偏好数据在 Kaggle 上用 **stage2 模型**生成（`--max_pairs 25000`，约 1-2h）——rejected 用 stage2 采样（on-policy，同分布质量偏好，符合 DPO 语义），不用基座
 7. 每 stage 单独 notebook + checkpoint 断点续跑（12h 会话限制）

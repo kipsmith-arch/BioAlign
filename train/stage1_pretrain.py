@@ -54,7 +54,9 @@ def main():
     parser.add_argument("--optim", type=str, default="adamw8bit",
                         choices=["adamw8bit", "adamw"],
                         help="优化器：adamw8bit 省显存（推荐 T4），adamw 为 fp32 全精度")
-    parser.set_defaults(use_4bit=False, lora_r=64, max_len=1024, per_device_batch=1)  # Stage 1 默认 bf16 + rank64 + batch1（T4 显存）
+    # Stage 1 默认 4bit：T4 单卡 bf16 3B 训练峰值装不下（加载后已 ~12GB）
+    # 4bit 省下的显存让给 max_len=2048（论文 2000 字符≈1200 token，几乎零截断）
+    parser.set_defaults(use_4bit=True, lora_r=64, max_len=2048, per_device_batch=1)
     args = parser.parse_args()
     setup_output_dir(args.output_dir)
 
