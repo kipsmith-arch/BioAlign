@@ -1,0 +1,96 @@
+# -*- coding: utf-8 -*-
+"""
+infer_eval.py —— 推理 + 评估
+==============================
+加载任意阶段 checkpoint（base + adapter），对 eval_set.jsonl（或其他含
+input/label/task 的 jsonl）生成回答，输出 evaluate.py 兼容格式：
+  {"input": ..., "label": ..., "task": ..., "model_output": ...}
+
+然后可选调用 eval/evaluate.py 计算各任务指标。
+
+用法（本地 0.5B 冒烟）：
+  python train/infer_eval.py \
+    --model_path D:/data/programe/AI/LM/Qwen2.5-0.5B-Instruct \
+    --ckpt_dir ckpt/stage2 --data_dir data_prep/output \
+    --in_file eval_set.jsonl --out_file eval_outputs_stage2.jsonl \
+    --max_new_tokens 64 --max_samples 20 --use_4bit
+"""
+import argparse
+import json
+import subprocess
+import sys
+
+import torch
+from peft import PeftModel
+
+sys.path.insert(0, __file__.rsplit("/", 1)[0])
+from common import SYSTEM_PROMPT, add_common_args, load_model_tokenizer, read_jsonl
+
+
+def main():
+    parser = argparse.ArgumentParser()
+    add_common_args(parser)
+    parser.add_argument("--ckpt_dir", type=str, default=None,
+                        help="待评估 checkpoint adapter 目录；不传则评估基座模型（零样本基线）")
+    parser.add_argument("--in_file", type=str, default="eval_set.jsonl")
+    parser.add_argument("--out_file", type=str, default="eval_outputs.jsonl")
+    parser.add_argument("--max_new_tokens", type=int, default=64)
+    parser.add_argument("--run_eval", action="store_true", help="推理后调用 eval/evaluate.py")
+    args = parser.parse_args()
+    sys.stdout.reconfigure(encoding="utf-8")
+
+    if args.ckpt_dir:
+        print(f"[Infer] 加载 base: {args.model_path} + adapter: {args.ckpt_dir}")
+        model, tokenizer = load_model_tokenizer(args.model_path, args.use_4bit, args.max_len)
+        model = PeftModel.from_pretrained(model, args.ckpt_dir)
+    else:
+        print(f"[Infer] 评估基座模型（无 adapter）: {args.model_path}")
+        model, tokenizer = load_model_tokenizer(args.model_path, args.use_4bit, args.max_len)
+    model.eval()
+
+    rows = read_jsonl(f"{args.data_dir}/{args.in_file}", args.max_samples)
+    print(f"[Infer] 读取 {args.in_file}: {len(rows)} 条")
+
+    out_path = f"{args.output_dir}/{args.out_file}"
+    with open(out_path, "w", encoding="utf-8") as f:
+        for i, r in enumerate(rows):
+            msgs = [
+                {"role": "system", "content": SYSTEM_PROMPT},
+                {"role": "user", "content": r["input"]},
+            ]
+            prompt_text = tokenizer.apply_chat_template(
+                msgs, tokenize=False, add_generation_prompt=True)
+            inputs = tokenizer(prompt_text, return_tensors="pt", truncation=True,
+                               max_length=args.max_len).to(model.device)
+            with torch.no_grad():
+                gen = model.generate(
+                    **inputs,
+                    max_new_tokens=args.max_new_tokens,
+                    do_sample=False,           # 贪婪解码，指标可复现
+                    pad_token_id=tokenizer.pad_token_id,
+                )
+            gen_ids = gen[0][inputs["input_ids"].shape[1]:]
+            answer = tokenizer.decode(gen_ids, skip_special_tokens=True).strip()
+            f.write(json.dumps({
+                "input": r["input"],
+                "label": r["label"],
+                "task": r["task"],
+                "model_output": answer,
+            }, ensure_ascii=False) + "\n")
+            if (i + 1) % 20 == 0:
+                print(f"  已推理 {i+1}/{len(rows)}")
+
+    print(f"[Infer] 完成 -> {out_path}")
+
+    if args.run_eval:
+        print("[Infer] 调用 eval/evaluate.py ...")
+        subprocess.run([
+            sys.executable, "eval/evaluate.py",
+            "--model_name", args.out_file.replace(".jsonl", ""),
+            "--OMICS", "all_omics",
+            "--input_file_path", out_path,
+        ], check=True)
+
+
+if __name__ == "__main__":
+    main()

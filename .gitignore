@@ -1,0 +1,11 @@
+*.pdf
+*.html
+*.pyc
+*.jsonl
+*.json
+data_prep/output
+!eval/*.json
+llm
+ckpt
+dataset
+seq
