@@ -54,7 +54,7 @@ def main():
     parser.add_argument("--optim", type=str, default="adamw8bit",
                         choices=["adamw8bit", "adamw"],
                         help="优化器：adamw8bit 省显存（推荐 T4），adamw 为 fp32 全精度")
-    parser.set_defaults(use_4bit=False, lora_r=64, max_len=1024)  # Stage 1 默认 bf16 + rank64
+    parser.set_defaults(use_4bit=False, lora_r=64, max_len=1024, per_device_batch=1)  # Stage 1 默认 bf16 + rank64 + batch1（T4 显存）
     args = parser.parse_args()
     setup_output_dir(args.output_dir)
 
@@ -66,6 +66,17 @@ def main():
                      dropout=args.lora_dropout, train_norm=args.train_norm)
     # 显式开启 gradient checkpointing（bf16 3B 长序列下激活是显存大头）
     model.gradient_checkpointing_enable()
+    # 显存诊断：确认 checkpoint 生效、可训练参数、峰值显存基线
+    if torch.cuda.is_available():
+        trainable = sum(p.numel() for p in model.parameters() if p.requires_grad)
+        # 新版 transformers 属性名为 is_gradient_checkpointing（旧版 gradient_checkpointing）
+        gc = getattr(model, 'is_gradient_checkpointing', None)
+        if gc is None:
+            gc = getattr(model, 'gradient_checkpointing', None)
+        print(f"[Stage1] gradient_checkpointing={gc}")
+        print(f"[Stage1] trainable={trainable:,} 已用显存={torch.cuda.memory_allocated()/2**30:.2f}GiB")
+        import transformers as _tf
+        print(f"[Stage1] transformers={_tf.__version__}")
 
     print(f"[Stage1] 读取序列数据: {args.data_dir}/stage1_pretrain.jsonl")
     rows = read_jsonl(f"{args.data_dir}/stage1_pretrain.jsonl", args.max_samples)
