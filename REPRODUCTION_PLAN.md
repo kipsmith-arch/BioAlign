@@ -45,7 +45,7 @@ dataset/ + seq/（原始数据）
 
 | Stage | 代码 | 数据 | 方法 | 关键参数 |
 |---|---|---|---|---|
-| 1 继续预训练 | `stage1_pretrain.py` | stage1_pretrain.jsonl（23.6万） | **bf16 LoRA+**（B lr=A×4）+ packing + 训 RMSNorm | r=64, lr=1e-4, max_len=2048 |
+| 1 继续预训练 | `stage1_pretrain.py` | stage1_pretrain.jsonl（23.6万） | **bf16 LoRA+**（B lr=A×4）+ packing + 训 RMSNorm | r=64, lr=1e-4, max_len=1024, 8bit AdamW |
 | 2 SFT | `stage2_sft.py` | train_pool_clean.jsonl（28.98万） | 4-bit QLoRA，assistant-only loss | r=16, lr=1e-4~2e-4, max_len=1024 |
 | 偏好构造 | `build_preference.py` | dpo_source（取 2-3 万） | chosen=标准答案 / rejected=基座生成（temp=0.9） | max_new_tokens=96 |
 | 3 DPO | `stage3_dpo.py` | dpo_pairs.jsonl | **自实现 DPO loss**（-log σ(β·Δlogratio)），π_ref=stage2 冻结 | β=0.1, lr=1e-5, 1 epoch |
@@ -82,12 +82,11 @@ CODE_DIR = /kaggle/input/bioalign-code/train      # 代码 Dataset 挂载点（�
 ### 第 2 个 notebook：全链路冒烟（前台，~1-1.5h）
 
 用 `smoke.jsonl`（4700 条）把五步全部跑通（每步 30-60 步/少量）。
-**原则：只缩数据量/步数，超参与正式完全一致**（Stage 1 冒烟也直接用 max_len=2048，
-验证长序列路径与显存预算，避免正式跑才发现 OOM）：
+**原则：只缩数据量/步数，超参与正式完全一致**（Stage 1 冒烟 max_len 也用正式值 1024，验证显存预算）：
 
 ```
 Stage1:  python $CODE_DIR/stage1_pretrain.py --model_path $MODEL_3B --data_dir $DATA_DIR \
-            --output_dir /kaggle/working/ckpt/stage1_smoke --max_len 2048 --max_steps 30 --max_samples 2000
+            --output_dir /kaggle/working/ckpt/stage1_smoke --max_len 1024 --max_steps 30 --max_samples 2000
 Stage2:  python $CODE_DIR/stage2_sft.py --model_path $MODEL_3B --data_dir $DATA_DIR \
             --output_dir /kaggle/working/ckpt/stage2_smoke --max_len 1024 --max_steps 60 --max_samples 1000
 偏好:    python $CODE_DIR/build_preference.py --model_path $MODEL_3B --data_dir $DATA_DIR \
@@ -103,14 +102,21 @@ DPO:     python $CODE_DIR/stage3_dpo.py --model_path $MODEL_3B --stage2_dir /kag
 
 ### 第 3 个 notebook：Stage 1 继续预训练（Commit，3-6h）
 
+### 第 3 个 notebook：Stage 1 继续预训练（Commit，3-6h）
+
+显存预算（T4 ~15GB）：bf16 3B 权重 6GB + 激活（grad checkpoint 后 ~2-4GB）+ 8bit 优化器 →
+**max_len 用 1024**（≈论文 2000 字符/1200 token 的合理近似），batch=2，8bit AdamW（默认）：
+
 ```
-python train/stage1_pretrain.py \
-  --model_path /kaggle/input/models/qwen-lm/qwen2.5/transformers/3b-instruct/1 \
-  --data_dir /kaggle/input/bioalign-data/output \
+python $CODE_DIR/stage1_pretrain.py \
+  --model_path $MODEL_3B \
+  --data_dir $DATA_DIR \
   --output_dir /kaggle/working/ckpt/stage1 \
-  --max_len 2048 --per_device_batch 4 --grad_accum 4 --lr 1e-4 \
+  --max_len 1024 --per_device_batch 2 --grad_accum 8 --lr 1e-4 \
   --epochs 1 --lora_plus_scaler 4
 ```
+（--optim 默认 adamw8bit；gradient checkpointing 已在脚本内显式开启；
+双卡 DDP 时 batch 减半、显存压力更小）
 ✅ 产出 `ckpt/stage1`（bf16 LoRA+ adapter）→ **立即下载**
 
 ### 第 4 个 notebook：Stage 2 ×2 分支（Commit ×2，各 2-4h）
@@ -209,6 +215,7 @@ stage3:   python $CODE_DIR/infer_eval.py --model_path $MODEL_3B --data_dir $DATA
 | T4×2 双卡扣费规则不确定 | 第一 notebook 实测 1h 扣 1h 还是 2h |
 | bitsandbytes 与 CUDA 不匹配 | 装完先 4bit 加载冒烟 |
 | Stage 1 欠拟合（loss 不降） | 加数据（GRCh38/RNAcentral 池还有余量）/加大 rank |
+| bf16 3B Stage 1 显存（OOM 实测） | 已修复：8bit AdamW + grad checkpoint + max_len 1024（见 train/README 问题 6）；备选 --use_4bit |
 | DPO 后任务指标下降 | β、lr 调小；训练中监控 eval_set |
 | commit 超时 working 被清 | 每 stage 一个 commit + 完成后立即下载 |
 | 模板同质化过拟合 | 已用 05 净化（模板均衡） |

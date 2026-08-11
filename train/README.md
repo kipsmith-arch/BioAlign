@@ -31,6 +31,7 @@
 3. trl 0.29 与 torch 2.5 不兼容（FSDPModule）→ **自实现 DPO loss**（不依赖 trl）
 4. peft 0.18 `from_pretrained` 后 LoRA 参数 requires_grad=False → 显式启用
 5. 新版 transformers `compute_loss` 需 `num_items_in_batch` 参数
+6. **3B Stage 1 OOM（Kaggle 实测）**：bf16 3B + max_len 2048 + fp32 AdamW 超 ~15GB 显存 → 修复：8bit AdamW（--optim adamw8bit，省 ~1.2GB）+ 显式 gradient checkpointing（激活 5-9GB→2-4GB）+ max_len 2048→1024（≈论文 2000 字符/1200 token）+ batch 4→2。修复后预算 ~9-11GB。验证：0.5B 无回归。
 
 ## 本地冒烟完整命令（0.5B）
 
@@ -79,7 +80,7 @@ python -X utf8 train/infer_eval.py \
 1. 模型路径：`/kaggle/input/models/qwen-lm/qwen2.5/transformers/3b-instruct/1`
 2. 数据上传：`data_prep/output/` 全部上传为 Kaggle Dataset，`--data_dir` 指向挂载路径
 3. 双卡：`torchrun --nproc_per_node=2 train/stage2_sft.py ... --grad_accum <单卡的一半>`
-4. **Stage 1 用 bf16 LoRA+**（rank 64，max_len 2048 吃满显存）；Stage 2/3 用 4bit QLoRA
+4. **Stage 1 用 bf16 LoRA+**（rank 64，**max_len 1024**——T4 显存约束下的合理近似，8bit AdamW + grad checkpoint）；Stage 2/3 用 4bit QLoRA
 5. 消融①需要两个 Stage 2 分支：`--model_path 基座`（stage2-only）vs `--model_path <stage1 产物>`
 6. DPO 偏好数据在 Kaggle 上用 **stage2 模型**生成（`--max_pairs 25000`，约 1-2h）——rejected 用 stage2 采样（on-policy，同分布质量偏好，符合 DPO 语义），不用基座
 7. 每 stage 单独 notebook + checkpoint 断点续跑（12h 会话限制）

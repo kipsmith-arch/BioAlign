@@ -51,15 +51,21 @@ def main():
                         help="LoRA+：B 权重学习率 = A×scaler（论文用 4）")
     parser.add_argument("--train_norm", action="store_true", default=True,
                         help="同时训练 RMSNorm 层（论文 Stage 1 做法）")
-    parser.set_defaults(use_4bit=False, lora_r=64, max_len=2048)  # Stage 1 默认 bf16 + rank64
+    parser.add_argument("--optim", type=str, default="adamw8bit",
+                        choices=["adamw8bit", "adamw"],
+                        help="优化器：adamw8bit 省显存（推荐 T4），adamw 为 fp32 全精度")
+    parser.set_defaults(use_4bit=False, lora_r=64, max_len=1024)  # Stage 1 默认 bf16 + rank64
     args = parser.parse_args()
     setup_output_dir(args.output_dir)
 
     print(f"[Stage1] 加载模型: {args.model_path} (4bit={args.use_4bit}, "
-          f"LoRA+ scaler={args.lora_plus_scaler}, train_norm={args.train_norm})")
+          f"LoRA+ scaler={args.lora_plus_scaler}, train_norm={args.train_norm}, "
+          f"optim={args.optim})")
     model, tokenizer = load_model_tokenizer(args.model_path, args.use_4bit, args.max_len)
     model = add_lora(model, r=args.lora_r, alpha=args.lora_alpha,
                      dropout=args.lora_dropout, train_norm=args.train_norm)
+    # 显式开启 gradient checkpointing（bf16 3B 长序列下激活是显存大头）
+    model.gradient_checkpointing_enable()
 
     print(f"[Stage1] 读取序列数据: {args.data_dir}/stage1_pretrain.jsonl")
     rows = read_jsonl(f"{args.data_dir}/stage1_pretrain.jsonl", args.max_samples)
@@ -88,7 +94,8 @@ def main():
         ddp_find_unused_parameters=False,
     )
     # LoRA+ 优化器：B 组 lr = base×scaler，A 组与 RMSNorm 用 base lr
-    optimizer = build_lora_plus_optimizer(model, args.lr, args.lora_plus_scaler)
+    optimizer = build_lora_plus_optimizer(model, args.lr, args.lora_plus_scaler,
+                                          use_8bit=(args.optim == "adamw8bit"))
     trainer = Trainer(model=model, args=train_args, train_dataset=dataset,
                       optimizers=(optimizer, None))
     print("[Stage1] 开始训练 ...")

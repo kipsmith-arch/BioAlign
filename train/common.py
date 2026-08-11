@@ -97,11 +97,17 @@ def add_lora(model, r: int = 16, alpha: int = 32, dropout: float = 0.05, train_n
     return model
 
 
-def build_lora_plus_optimizer(model, base_lr: float, scaler: float = 4.0, weight_decay: float = 0.0):
+def build_lora_plus_optimizer(model, base_lr: float, scaler: float = 4.0, weight_decay: float = 0.0, use_8bit: bool = True):
     """LoRA+ 优化器（Hayou et al. 2024）：B 权重的学习率 = A 的 scaler 倍。
     论文使用 scaler=4（原论文建议 16，继续预训练中 16 不稳定）。
-    分组：lora_A / lora_B / 其他可训练参数（如 RMSNorm）。"""
-    from torch.optim import AdamW
+    分组：lora_A / lora_B / 其他可训练参数（如 RMSNorm）。
+    use_8bit：bitsandbytes 8bit AdamW，大幅节省优化器状态显存（fp32 8B/参数 → 1B/参数）。"""
+    if use_8bit:
+        from bitsandbytes.optim import AdamW8bit
+        Opt = AdamW8bit
+    else:
+        from torch.optim import AdamW
+        Opt = AdamW
     group_a, group_b, group_other = [], [], []
     for n, p in model.named_parameters():
         if not p.requires_grad:
@@ -112,7 +118,7 @@ def build_lora_plus_optimizer(model, base_lr: float, scaler: float = 4.0, weight
             group_b.append(p)
         else:
             group_other.append(p)
-    return AdamW([
+    return Opt([
         {"params": group_a, "lr": base_lr},
         {"params": group_b, "lr": base_lr * scaler},
         {"params": group_other, "lr": base_lr},
