@@ -31,7 +31,11 @@
 3. trl 0.29 与 torch 2.5 不兼容（FSDPModule）→ **自实现 DPO loss**（不依赖 trl）
 4. peft 0.18 `from_pretrained` 后 LoRA 参数 requires_grad=False → 显式启用
 5. 新版 transformers `compute_loss` 需 `num_items_in_batch` 参数
-6. **3B Stage 1 OOM（Kaggle 实测）**：bf16 3B + max_len 2048 + fp32 AdamW 超 ~15GB 显存 → 修复：8bit AdamW（--optim adamw8bit，省 ~1.2GB）+ 显式 gradient checkpointing（激活 5-9GB→2-4GB）+ max_len 2048→1024（≈论文 2000 字符/1200 token）+ batch 4→2。修复后预算 ~9-11GB。验证：0.5B 无回归。
+6. **3B Stage 1 OOM（Kaggle 实测，两次）**：
+   - 第一次：bf16 3B + max_len 2048 + fp32 AdamW 超预算 → 8bit AdamW + grad checkpoint + max_len 1024（部分缓解）
+   - 第二次（max_len 1024 仍 OOM）：根因是 **loss 计算的 logits 峰值**——cross-entropy 把 logits 转 fp32，张量 ≈ batch×seq×vocab×4B（batch4×1024×151936×4B≈2.49GB），加上权重 6.1GB 后超预算 → **per_device_batch 4→1**（峰值 2.49→0.6GB）+ grad_accum 补 global batch
+   - 附带发现：新版 transformers 属性名 `is_gradient_checkpointing`（非 `gradient_checkpointing`）；3B 实测 trainable=3.74%（0.5B 的 6.66% 外推偏高，跨规模外推不可靠）
+   - 当前配置：8bit AdamW + grad checkpoint + max_len 1024 + batch 1 → 预算 ~8-9GB
 
 ## 本地冒烟完整命令（0.5B）
 

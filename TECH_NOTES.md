@@ -17,8 +17,11 @@
 | 优化器状态（fp32 AdamW） | 可训练参数 × 8B/参数 | ✅ 公式精确，输入是估算 |
 | 优化器状态（8bit AdamW） | 可训练参数 × ~1B/参数 | ✅ bnb 量化后 |
 | **激活（激活函数中间量）** | **无简洁公式** | ⚠️ **纯经验量级，以实测为准** |
+| **loss logits 峰值** | **batch × seq × vocab × 4B（fp32 计算 CE）** | ⚠️ **易被忽略的峰值源**（实测：batch4×1024×151936×4B≈2.49GB） |
 
-**关键原则：权重/优化器可精确预算；激活只能给量级，最终以显存监控 / OOM 报错反推为准。**
+**关键原则：权重/优化器可精确预算；激活只能给量级；还要注意 loss 计算在 vocab 维度上的 logits 峰值张量**——最终以显存监控 / OOM 报错反推为准。
+
+**实测教训（3B Stage 1 两次 OOM）**：max_len 1024 + 8bit 优化器 + checkpoint 后仍超预算，反推根因是 loss 的 logits 峰值（batch 4 × vocab 151936 × 4B ≈ 2.49GB）——**batch 是这类峰值张量的直接缩放因子**，显存不足时优先降 batch（1），用 grad_accum 补 global batch。**
 
 ### 1.2 优化器状态为什么是 8B/参数（m + v）
 
@@ -50,7 +53,7 @@ A: r × d_in，B: d_out × r   → 新增参数 = r × (d_in + d_out)
 
 **实际取值不用手算**：`model.print_trainable_parameters()`（peft 内置，内部是 `sum(p.numel() for p in model.parameters() if p.requires_grad)`）。
 
-⚠️ **外推注意**：0.5B 实测 trainable 占比 6.66%（r=64），外推到 3B 假设比例相近——但层数/维度不同（0.5B 26 层 vs 3B 36 层），比例略有偏差。**跨模型规模外推是估算**，精确值要在目标模型上跑 `print_trainable_parameters()`。
+⚠️ **外推注意**：0.5B 实测 trainable 占比 6.66%（r=64），3B 实测 **3.74%**（120M/3.21B）——**跨模型规模外推比例不可靠**（层数/维度/FFN 比例不同），精确值必须在目标模型上跑 `print_trainable_parameters()`。
 
 ### 1.4 激活为什么难算（gradient checkpointing 原理）
 
@@ -116,4 +119,5 @@ for n, p in model.named_parameters():
 
 ### 2.7 Trainer 训练的基础坑速查（版本相关，详见 train/README）
 - **默认 collator 不 padding**：长度不一的样本必须显式传 `DataCollatorForSeq2Seq`（labels 用 `label_pad_token_id=-100`），否则 batch 拼不齐报维度错误
+- **新版 transformers 属性名变化**：`is_gradient_checkpointing`（旧版 `gradient_checkpointing`）——诊断代码要兼容两者
 - `Dataset.from_list` 不接受 generator（需转 list）；新版 transformers `compute_loss` 签名多了 `num_items_in_batch`——这些属 API 版本变化，踩坑记录留在 train/README。
