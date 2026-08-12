@@ -18,6 +18,7 @@ label 置为 -100），防止模型学会"复述问题"。
 """
 import argparse
 import sys
+import os
 
 from datasets import Dataset
 from peft import PeftModel
@@ -69,8 +70,8 @@ def main():
         print(f"[Stage2] 加载模型: {args.model_path} (4bit={args.use_4bit})")
     model, tokenizer = load_model_tokenizer(args.model_path, args.use_4bit, args.max_len)
     if args.resume_adapter:
-    if IS_MAIN:
-        print(f"[Stage2] 从 Stage1 adapter 继续: {args.resume_adapter}")
+        if IS_MAIN:
+            print(f"[Stage2] 从 Stage1 adapter 继续: {args.resume_adapter}")
         model = PeftModel.from_pretrained(model, args.resume_adapter)
         for n, p in model.named_parameters():
             if "lora" in n:

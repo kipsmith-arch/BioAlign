@@ -21,6 +21,8 @@ stage1_pretrain.py —— Stage 1: 领域继续预训练（bf16 LoRA+）
 """
 import argparse
 import sys
+import os
+IS_MAIN = int(os.environ.get("LOCAL_RANK", "0")) == 0
 
 import torch
 from datasets import Dataset

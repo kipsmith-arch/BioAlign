@@ -30,6 +30,7 @@ stage3_dpo.py —— Stage 3: RL（DPO 偏好对齐，自实现 DPO loss）
 """
 import argparse
 import sys
+import os
 
 import torch
 import torch.nn.functional as F
