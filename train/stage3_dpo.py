@@ -38,8 +38,8 @@ from peft import PeftModel
 from transformers import Trainer, TrainingArguments
 
 sys.path.insert(0, __file__.rsplit("/", 1)[0])
-from common import (SYSTEM_PROMPT, add_common_args, load_model_tokenizer,
-                    read_jsonl, setup_output_dir)
+from common import (ProgressCallback, SYSTEM_PROMPT, add_common_args, load_model_tokenizer,
+                    read_jsonl, setup_env, setup_output_dir)
 
 
 def encode_pair(pair, tokenizer, max_len, system_prompt):
@@ -140,6 +140,7 @@ def main():
     parser.add_argument("--beta", type=float, default=0.1)
     parser.add_argument("--dpo_data", type=str, default="dpo_pairs.jsonl")
     args = parser.parse_args()
+    setup_env()
     setup_output_dir(args.output_dir)
 
     print(f"[Stage3] 加载 base: {args.model_path} + stage2 adapter: {args.stage2_dir}")
@@ -169,7 +170,8 @@ def main():
         num_train_epochs=args.epochs,
         max_steps=args.max_steps if args.max_steps > 0 else -1,
         bf16=True,
-        logging_steps=5,
+        logging_steps=25,
+        disable_tqdm=True,
         save_strategy="steps",
         save_steps=args.max_steps if args.max_steps > 0 else 200,
         save_total_limit=2,
@@ -183,6 +185,7 @@ def main():
         args=train_args, train_dataset=dataset,
         tokenizer=tokenizer, data_collator=DPODataCollator(tokenizer),
     )
+    trainer.add_callback(ProgressCallback())
     print("[Stage3] 开始 DPO 训练 ...")
     trainer.train()
     print(f"[Stage3] 保存 adapter 到 {args.output_dir}")

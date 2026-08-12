@@ -24,8 +24,8 @@ from peft import PeftModel
 from transformers import DataCollatorForSeq2Seq, Trainer, TrainingArguments
 
 sys.path.insert(0, __file__.rsplit("/", 1)[0])
-from common import (SYSTEM_PROMPT, add_common_args, add_lora,
-                    load_model_tokenizer, read_jsonl, setup_output_dir)
+from common import (ProgressCallback, SYSTEM_PROMPT, add_common_args, add_lora,
+                    load_model_tokenizer, read_jsonl, setup_env, setup_output_dir)
 
 
 def encode_sft(item, tokenizer, max_len, system_prompt):
@@ -60,6 +60,7 @@ def main():
                              "不传则从基座直接训（stage2-only 分支）")
     parser.set_defaults(lora_r=64)  # 两分支统一 rank=64，保证消融①只差“有无 Stage1”
     args = parser.parse_args()
+    setup_env()
     setup_output_dir(args.output_dir)
 
     print(f"[Stage2] 加载模型: {args.model_path} (4bit={args.use_4bit})")
@@ -89,7 +90,8 @@ def main():
         num_train_epochs=args.epochs,
         max_steps=args.max_steps if args.max_steps > 0 else -1,
         bf16=True,
-        logging_steps=5,
+        logging_steps=25,
+        disable_tqdm=True,
         save_strategy="steps",
         save_steps=args.max_steps if args.max_steps > 0 else 500,
         save_total_limit=2,
@@ -101,6 +103,7 @@ def main():
     trainer = Trainer(model=model, args=train_args, train_dataset=dataset,
                       data_collator=DataCollatorForSeq2Seq(
                           tokenizer, padding=True, label_pad_token_id=-100))
+    trainer.add_callback(ProgressCallback())
     print("[Stage2] 开始训练 ...")
     trainer.train()
     print(f"[Stage2] 保存 adapter 到 {args.output_dir}")

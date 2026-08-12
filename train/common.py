@@ -12,10 +12,11 @@ import argparse
 import json
 import os
 import sys
+import time
 
 import torch
 from peft import LoraConfig, get_peft_model, prepare_model_for_kbit_training
-from transformers import AutoModelForCausalLM, AutoTokenizer, BitsAndBytesConfig
+from transformers import AutoModelForCausalLM, AutoTokenizer, BitsAndBytesConfig, TrainerCallback
 
 QWEN_TARGET_MODULES = [
     "q_proj", "k_proj", "v_proj", "o_proj",
@@ -28,6 +29,42 @@ SYSTEM_PROMPT = (
     "Please answer my biology sequence-related questions clearly and concisely. "
     "For regression tasks, please return a number."
 )
+
+
+def setup_env():
+    """训练环境清理：消除 Kaggle Debugger 重复警告、tokenizer 并行警告。
+    必须在任何 transformers/torch 导入前调用。"""
+    os.environ.setdefault("PYDEVD_DISABLE_FILE_VALIDATION", "1")
+    os.environ.setdefault("TOKENIZERS_PARALLELISM", "false")
+
+
+class ProgressCallback(TrainerCallback):
+    """训练进度日志（替代不可用的 tqdm）：步数/进度%/loss/显存/ETA。
+    仅 rank 0 打印，避免 DDP 双进程重复日志；显式 flush 保证 commit 模式可见。"""
+
+    def on_train_begin(self, args, state, control, **kwargs):
+        self.t0 = time.time()
+        self.is_main = int(os.environ.get("LOCAL_RANK", "0")) == 0
+
+    def on_log(self, args, state, control, logs, **kwargs):
+        if not self.is_main:
+            return
+        gs = state.global_step
+        total = state.max_steps if (state.max_steps and state.max_steps > 0) else None
+        elapsed = time.time() - self.t0
+        if total:
+            pct = f"{100 * gs / total:.1f}%"
+            eta = elapsed / gs * (total - gs) if gs > 0 else None
+            eta_s = f"{eta / 3600:.1f}h" if eta else "?"
+            step_s = f"{gs}/{total}"
+        else:
+            pct, eta_s, step_s = "?", "?", str(gs)
+        mem = torch.cuda.memory_allocated() / 2 ** 30 if torch.cuda.is_available() else 0
+        loss = logs.get("loss", "?")
+        loss_s = f"{loss:.4f}" if isinstance(loss, float) else loss
+        print(f"[进度] step {step_s} ({pct}) | loss={loss_s} | "
+              f"已用 {elapsed / 60:.1f}min | ETA {eta_s} | 显存 {mem:.1f}GiB",
+              flush=True)
 
 
 def add_common_args(parser: argparse.ArgumentParser):

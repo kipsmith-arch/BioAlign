@@ -45,7 +45,7 @@ dataset/ + seq/（原始数据）
 
 | Stage | 代码 | 数据 | 方法 | 关键参数 |
 |---|---|---|---|---|
-| 1 继续预训练 | `stage1_pretrain.py` | stage1_pretrain.jsonl（23.6万） | **4-bit QLoRA + LoRA+**（B lr=A×4）+ packing + 训 RMSNorm | r=64, lr=1e-4, **max_len=2048**, 8bit AdamW, batch 1 |
+| 1 继续预训练 | `stage1_pretrain.py` | stage1_pretrain.jsonl（**抽样 3 万**） | **4-bit QLoRA + LoRA+**（B lr=A×4）+ packing + 训 RMSNorm | r=64, lr=1e-4, **max_len=1024**, 8bit AdamW, batch 1 |
 | 2 SFT | `stage2_sft.py` | train_pool_clean.jsonl（28.98万） | 4-bit QLoRA，assistant-only loss | r=16, lr=1e-4~2e-4, max_len=1024 |
 | 偏好构造 | `build_preference.py` | dpo_source（取 2-3 万） | chosen=标准答案 / rejected=基座生成（temp=0.9） | max_new_tokens=96 |
 | 3 DPO | `stage3_dpo.py` | dpo_pairs.jsonl | **自实现 DPO loss**（-log σ(β·Δlogratio)），π_ref=stage2 冻结 | β=0.1, lr=1e-5, 1 epoch |
@@ -106,32 +106,35 @@ DPO:     python $CODE_DIR/stage3_dpo.py --model_path $MODEL_3B --stage2_dir /kag
 ### 第 3 个 notebook：Stage 1 继续预训练（Commit，3-6h）
 
 **最终显存策略（三次 OOM 收敛）**：bf16 3B 单卡/DDP 均装不下（加载后 11.94GB）→
-**4bit QLoRA 定稿**，并把省下的显存让给 **max_len=2048**（覆盖论文 2000 字符序列，几乎零截断）：
+**4bit QLoRA 定稿**。**时间教训**：全量 23.6 万条 × max_len 2048 需 ~19h（超 12h commit）→
+Stage 1 是热身，**抽样 3 万条（每源约 1 万）+ max_len 1024**（~2h）：
 
 ```
-python $CODE_DIR/stage1_pretrain.py \
+torchrun --nproc_per_node=2 $CODE_DIR/stage1_pretrain.py \
   --model_path $MODEL_3B \
   --data_dir $DATA_DIR \
   --output_dir /kaggle/working/ckpt/stage1 \
-  --max_len 2048 --per_device_batch 1 --grad_accum 8 --lr 1e-4 \
+  --max_len 1024 --max_samples 30000 \
+  --per_device_batch 1 --grad_accum 4 --lr 1e-4 \
   --epochs 1 --lora_plus_scaler 4
 ```
-（默认 use_4bit=True + optim=adamw8bit + grad checkpoint；双卡 torchrun + grad_accum 减半）
+（stage1_pretrain.jsonl 是打乱合并的，取前 3 万 ≈ 每源 1 万，三源平衡；
+默认 use_4bit + 8bit AdamW + grad checkpoint）
 ✅ 产出 `ckpt/stage1`（4bit QLoRA adapter）→ **立即下载**
 
 ### 第 4 个 notebook：Stage 2 ×2 分支（Commit ×2，各 2-4h）
 
 ```
 分支 A（stage2-only，不传 --resume_adapter = 从基座训练）：
-  python $CODE_DIR/stage2_sft.py --model_path $MODEL_3B --data_dir $DATA_DIR \
+  torchrun --nproc_per_node=2 $CODE_DIR/stage2_sft.py --model_path $MODEL_3B --data_dir $DATA_DIR \
     --output_dir /kaggle/working/ckpt/stage2_only \
-    --max_len 1024 --per_device_batch 4 --grad_accum 4 --lr 2e-4 --epochs 1
+    --max_len 2048 --per_device_batch 1 --grad_accum 4 --lr 2e-4 --epochs 1
 
 分支 B（stage1+stage2，stage1 adapter 已下载并作为 input 挂载）：
-  python $CODE_DIR/stage2_sft.py --model_path $MODEL_3B --data_dir $DATA_DIR \
+  torchrun --nproc_per_node=2 $CODE_DIR/stage2_sft.py --model_path $MODEL_3B --data_dir $DATA_DIR \
     --resume_adapter /kaggle/input/stage1-adapter \
     --output_dir /kaggle/working/ckpt/stage2_s1 \
-    --max_len 1024 --per_device_batch 4 --grad_accum 4 --lr 2e-4 --epochs 1
+    --max_len 2048 --per_device_batch 1 --grad_accum 4 --lr 2e-4 --epochs 1
 ```
 ✅ 产出两个 adapter（两分支统一 r=64，消融①只差"有无 Stage 1"）→ 下载
 
@@ -147,24 +150,25 @@ python $CODE_DIR/build_preference.py \
   --output_dir /kaggle/working --max_pairs 25000 \
   --max_new_tokens 96 --temperature 0.9
 ```
+（**保持单卡**：脚本无 rank 分片逻辑，双卡会重复生成）
 ✅ 产出 `dpo_pairs.jsonl`（2.5 万对）→ 下载（Stage 3 与评估的 input）
 
 ### 第 6 个 notebook：Stage 3 DPO（Commit，2-3h）
 
 ```
-python $CODE_DIR/stage3_dpo.py \
+torchrun --nproc_per_node=2 $CODE_DIR/stage3_dpo.py \
   --model_path $MODEL_3B --stage2_dir /kaggle/input/stage2-s1-adapter \
   --data_dir $DATA_DIR \
   --output_dir /kaggle/working/ckpt/stage3 \
-  --dpo_data dpo_pairs.jsonl --max_len 1024 --per_device_batch 2 \
+  --dpo_data dpo_pairs.jsonl --max_len 2048 --per_device_batch 1 \
   --grad_accum 4 --lr 1e-5 --beta 0.1 --epochs 1
 ```
-（`--dpo_data dpo_pairs.jsonl` 由 nb5 生成后下载、作为 input 挂载；脚本在 `--data_dir` 下读取）
+（`--dpo_data dpo_pairs.jsonl` 由 nb5 生成后下载、作为 input 挂载；DPO 含 model+ref 双模型，显存紧张时单卡保底：去 torchrun + max_len 1024）
 ✅ 产出 `ckpt/stage3` → 下载
 
 ### 第 7 个 notebook：评估（前台，1-2h）
 
-4 档模型 × eval_set（1.89 万条，可分批）：
+4 档模型 × eval_set（1.89 万条，可分批；**infer 保持单卡**）：
 
 ```
 基座:     python $CODE_DIR/infer_eval.py --model_path $MODEL_3B --data_dir $DATA_DIR \
@@ -185,7 +189,8 @@ stage3:   python $CODE_DIR/infer_eval.py --model_path $MODEL_3B --data_dir $DATA
 
 1. commit 失败/超时会清空 working → 每个 commit 完成后**立即下载 checkpoint**；下一个 notebook 把上一个 checkpoint 作为 input 挂载
 2. Stage 2 两分支统一 r=64，消融①只差"有无 Stage 1"
-3. 双卡命令加 `torchrun --nproc_per_node=2`，grad_accum 减半（已实测配额扣 1h/1h，全流程双卡）
+3. **双卡 DDP 命令**（已实测配额扣 1h/1h，全流程双卡）：`torchrun --nproc_per_node=2 python ...`，**grad_accum 减半保持 global batch**；Trainer 自动数据分片；`build_preference`/`infer_eval` 无 rank 分片逻辑，保持单卡
+4. **单卡显存实测 10.8GiB**（4bit + max_len 2048 稳定运行），双卡每卡同类开销 + 分片 batch，14.56GB 余量充足
 
 ## 5. 时间预算（T4×2，3B）
 
@@ -193,7 +198,7 @@ stage3:   python $CODE_DIR/infer_eval.py --model_path $MODEL_3B --data_dir $DATA
 |---|---|---|
 | 环境验证 + 配额实测 | 1h | 前台（✅ 已确认双卡扣 1h） |
 | 全链路冒烟（含 torchrun 双卡验证） | 1-1.5h | 前台 |
-| Stage 1（23.6万×1 epoch，bf16 LoRA+） | 3-6h | commit |
+| Stage 1（抽样 3 万条×1 epoch，4bit，双卡） | 1.5-2.5h | commit |
 | Stage 2（28.98万×1 epoch，QLoRA）×2 分支 | 4-8h | commit×2 |
 | build_preference（2.5万对，基座生成） | 1-2h | commit |
 | Stage 3 DPO（2.5万对×1 epoch） | 2-3h | commit |

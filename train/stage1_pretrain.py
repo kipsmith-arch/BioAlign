@@ -27,8 +27,8 @@ from datasets import Dataset
 from transformers import Trainer, TrainingArguments
 
 sys.path.insert(0, __file__.rsplit("/", 1)[0])
-from common import (add_common_args, add_lora, build_lora_plus_optimizer,
-                    load_model_tokenizer, read_jsonl, setup_output_dir)
+from common import (ProgressCallback, add_common_args, add_lora, build_lora_plus_optimizer,
+                    load_model_tokenizer, read_jsonl, setup_env, setup_output_dir)
 
 
 def pack_texts(texts, tokenizer, max_len):
@@ -58,6 +58,7 @@ def main():
     # 4bit 省下的显存让给 max_len=2048（论文 2000 字符≈1200 token，几乎零截断）
     parser.set_defaults(use_4bit=True, lora_r=64, max_len=2048, per_device_batch=1)
     args = parser.parse_args()
+    setup_env()
     setup_output_dir(args.output_dir)
 
     print(f"[Stage1] 加载模型: {args.model_path} (4bit={args.use_4bit}, "
@@ -97,7 +98,8 @@ def main():
         num_train_epochs=args.epochs,
         max_steps=args.max_steps if args.max_steps > 0 else -1,
         bf16=True,
-        logging_steps=5,
+        logging_steps=25,
+        disable_tqdm=True,
         save_strategy="steps",
         save_steps=args.max_steps if args.max_steps > 0 else 500,
         save_total_limit=2,
@@ -111,6 +113,7 @@ def main():
                                           use_8bit=(args.optim == "adamw8bit"))
     trainer = Trainer(model=model, args=train_args, train_dataset=dataset,
                       optimizers=(optimizer, None))
+    trainer.add_callback(ProgressCallback())
     print("[Stage1] 开始训练 ...")
     trainer.train()
     print(f"[Stage1] 保存 adapter 到 {args.output_dir}")

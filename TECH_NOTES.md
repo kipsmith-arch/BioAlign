@@ -122,6 +122,7 @@ for n, p in model.named_parameters():
 ### 2.7 Trainer 训练的基础坑速查（版本相关，详见 train/README）
 - **默认 collator 不 padding**：长度不一的样本必须显式传 `DataCollatorForSeq2Seq`（labels 用 `label_pad_token_id=-100`），否则 batch 拼不齐报维度错误
 - **新版 transformers 属性名变化**：`is_gradient_checkpointing`（旧版 `gradient_checkpointing`）——诊断代码要兼容两者
+- **训练进度可见性（commit 模式下 tqdm 不可用）**：三个训练脚本注册 `ProgressCallback`（common.py）——每 `logging_steps`（25）打印 `[进度] step/总步数 百分比 loss 已用时间 ETA 显存`，仅 rank 0 打印避免 DDP 重复；`setup_env()` 设置 `PYDEVD_DISABLE_FILE_VALIDATION=1` + `TOKENIZERS_PARALLELISM=false` 消除 Kaggle 重复警告
 - `Dataset.from_list` 不接受 generator（需转 list）；新版 transformers `compute_loss` 签名多了 `num_items_in_batch`——这些属 API 版本变化，踩坑记录留在 train/README。
 
 ### 2.8 max_len 的两层语义 + DeepSpeed ZeRO（显存主题延伸）
