@@ -54,6 +54,12 @@ def setup_env():
             return _orig_ckpt(function, *args, **kwargs)
         _ckpt_patched._patched_use_reentrant = True
         _ckpt_mod.checkpoint = _ckpt_patched
+    # Monkey-patch Trainer.tokenizer property：消除 "Trainer.tokenizer is now deprecated" 警告
+    # transformers 4.52 的 @property 在每次访问 trainer.tokenizer 时都 warn——覆盖为直接返回 processing_class
+    from transformers import Trainer as _HfTrainer
+    if not getattr(_HfTrainer, "_patched_no_tokenizer_warning", False):
+        _HfTrainer.tokenizer = property(lambda self: self.processing_class)
+        _HfTrainer._patched_no_tokenizer_warning = True
     # 注册 DDP 进程组清理函数：异常退出（OOM 强杀/KeyboardInterrupt）时也能执行
     # 消除 "destroy_process_group() was not called before program exit" 警告
     import atexit

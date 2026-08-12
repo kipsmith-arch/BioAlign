@@ -195,13 +195,19 @@ def main():
         remove_unused_columns=False,
         seed=args.seed,
         report_to=[],
-        ddp_find_unused_parameters=True,  # DPO 双模型，DDP 同步允许某些参数未参与 loss
+        ddp_find_unused_parameters=False,  # DPO 实际无 unused 参数（之前 True 是防御）
     )
     trainer = DPOTrainer(
         model=model, ref_model=ref_model, beta=args.beta,
         args=train_args, train_dataset=dataset,
         processing_class=tokenizer, data_collator=DPODataCollator(tokenizer),
     )
+    # 确保 trainer.processing_class 已设（避免 transformers 内部访问 .tokenizer 触发 deprecation）
+    if trainer.processing_class is None:
+        trainer.processing_class = tokenizer
+    # DPO 的 input key 是 chosen_input_ids/rejected_input_ids，告知 Trainer 让其能 estimate tokens
+    if hasattr(model, "main_input_name"):
+        model.main_input_name = "chosen_input_ids"
     trainer.add_callback(ProgressCallback())
     if IS_MAIN:
         print("[Stage3] 开始 DPO 训练 ...")
