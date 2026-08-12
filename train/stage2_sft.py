@@ -63,9 +63,13 @@ def main():
     setup_env()
     setup_output_dir(args.output_dir)
 
-    print(f"[Stage2] 加载模型: {args.model_path} (4bit={args.use_4bit})")
+    # 所有诊断 print 只在主进程输出，避免 DDP 双进程重复日志
+    IS_MAIN = int(os.environ.get("LOCAL_RANK", "0")) == 0
+    if IS_MAIN:
+        print(f"[Stage2] 加载模型: {args.model_path} (4bit={args.use_4bit})")
     model, tokenizer = load_model_tokenizer(args.model_path, args.use_4bit, args.max_len)
     if args.resume_adapter:
+    if IS_MAIN:
         print(f"[Stage2] 从 Stage1 adapter 继续: {args.resume_adapter}")
         model = PeftModel.from_pretrained(model, args.resume_adapter)
         for n, p in model.named_parameters():
@@ -74,9 +78,11 @@ def main():
     else:
         model = add_lora(model, r=args.lora_r, alpha=args.lora_alpha, dropout=args.lora_dropout)
 
-    print(f"[Stage2] 读取指令数据: {args.data_dir}/{args.train_file}")
+    if IS_MAIN:
+        print(f"[Stage2] 读取指令数据: {args.data_dir}/{args.train_file}")
     rows = read_jsonl(f"{args.data_dir}/{args.train_file}", args.max_samples)
-    print(f"[Stage2] 样本数: {len(rows)}")
+    if IS_MAIN:
+        print(f"[Stage2] 样本数: {len(rows)}")
 
     dataset = Dataset.from_list(
         [encode_sft(r, tokenizer, args.max_len, SYSTEM_PROMPT) for r in rows])
@@ -92,6 +98,8 @@ def main():
         bf16=True,
         logging_steps=25,
         disable_tqdm=True,
+        log_on_each_node=False,
+        label_names=[],
         save_strategy="steps",
         save_steps=args.max_steps if args.max_steps > 0 else 500,
         save_total_limit=2,
@@ -104,12 +112,15 @@ def main():
                       data_collator=DataCollatorForSeq2Seq(
                           tokenizer, padding=True, label_pad_token_id=-100))
     trainer.add_callback(ProgressCallback())
-    print("[Stage2] 开始训练 ...")
+    if IS_MAIN:
+        print("[Stage2] 开始训练 ...")
     trainer.train()
-    print(f"[Stage2] 保存 adapter 到 {args.output_dir}")
+    if IS_MAIN:
+        print(f"[Stage2] 保存 adapter 到 {args.output_dir}")
     model.save_pretrained(args.output_dir)
     tokenizer.save_pretrained(args.output_dir)
-    print("[Stage2] 完成。")
+    if IS_MAIN:
+        print("[Stage2] 完成。")
 
 
 if __name__ == "__main__":

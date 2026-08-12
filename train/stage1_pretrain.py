@@ -69,25 +69,29 @@ def main():
                      dropout=args.lora_dropout, train_norm=args.train_norm)
     # 显式开启 gradient checkpointing（bf16 3B 长序列下激活是显存大头）
     model.gradient_checkpointing_enable()
-    # 显存诊断：确认 checkpoint 生效、可训练参数、峰值显存基线
-    if torch.cuda.is_available():
+    if torch.cuda.is_available() and IS_MAIN:
         trainable = sum(p.numel() for p in model.parameters() if p.requires_grad)
         # 新版 transformers 属性名为 is_gradient_checkpointing（旧版 gradient_checkpointing）
         gc = getattr(model, 'is_gradient_checkpointing', None)
         if gc is None:
             gc = getattr(model, 'gradient_checkpointing', None)
-        print(f"[Stage1] gradient_checkpointing={gc}")
-        print(f"[Stage1] trainable={trainable:,} 已用显存={torch.cuda.memory_allocated()/2**30:.2f}GiB")
+        # max_memory_allocated 更接近 nvidia-smi 口径（含 PyTorch caching allocator 预留）
+        mem = torch.cuda.max_memory_allocated() / 2 ** 30
         import transformers as _tf
+        print(f"[Stage1] gradient_checkpointing={gc}")
+        print(f"[Stage1] trainable={trainable:,} 峰值显存={mem:.2f}GiB")
         print(f"[Stage1] transformers={_tf.__version__}")
 
-    print(f"[Stage1] 读取序列数据: {args.data_dir}/stage1_pretrain.jsonl")
+    if IS_MAIN:
+        print(f"[Stage1] 读取序列数据: {args.data_dir}/stage1_pretrain.jsonl")
     rows = read_jsonl(f"{args.data_dir}/stage1_pretrain.jsonl", args.max_samples)
     texts = [r["text"] for r in rows]
-    print(f"[Stage1] 序列条数: {len(texts)}")
+    if IS_MAIN:
+        print(f"[Stage1] 序列条数: {len(texts)}")
 
     blocks = pack_texts(texts, tokenizer, args.max_len)
-    print(f"[Stage1] packing 后块数: {len(blocks)} (max_len={args.max_len})")
+    if IS_MAIN:
+        print(f"[Stage1] packing 后块数: {len(blocks)} (max_len={args.max_len})")
     dataset = Dataset.from_list(blocks)
 
     train_args = TrainingArguments(
@@ -100,6 +104,8 @@ def main():
         bf16=True,
         logging_steps=25,
         disable_tqdm=True,
+        log_on_each_node=False,
+        label_names=[],
         save_strategy="steps",
         save_steps=args.max_steps if args.max_steps > 0 else 500,
         save_total_limit=2,
@@ -114,12 +120,15 @@ def main():
     trainer = Trainer(model=model, args=train_args, train_dataset=dataset,
                       optimizers=(optimizer, None))
     trainer.add_callback(ProgressCallback())
-    print("[Stage1] 开始训练 ...")
+    if IS_MAIN:
+        print("[Stage1] 开始训练 ...")
     trainer.train()
-    print(f"[Stage1] 保存 adapter 到 {args.output_dir}")
+    if IS_MAIN:
+        print(f"[Stage1] 保存 adapter 到 {args.output_dir}")
     model.save_pretrained(args.output_dir)
     tokenizer.save_pretrained(args.output_dir)
-    print("[Stage1] 完成。")
+    if IS_MAIN:
+        print("[Stage1] 完成。")
 
 
 if __name__ == "__main__":

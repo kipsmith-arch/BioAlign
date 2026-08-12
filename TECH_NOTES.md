@@ -128,3 +128,23 @@ for n, p in model.named_parameters():
 ### 2.8 max_len 的两层语义 + DeepSpeed ZeRO（显存主题延伸）
 - **max_len 语义**：Stage 1 packing 下是**块大小**（不截断，仅丢弃尾部碎片，块越小碎片比例越低）；Stage 2/DPO 下是**序列长度上限**（超长样本尾部会被截断）。生物长序列任务中"序列完整性"优先 → 4bit 省出的显存应让给 max_len（本项目 1024→2048）
 - **DeepSpeed ZeRO**：分片训练状态消除冗余（ZeRO-1 优化器 / ZeRO-2 +梯度 / ZeRO-3 +参数，通信开销递增）。对 3B：优化器+梯度合计仅 ~1.3GB，ZeRO-2 双卡省 ~0.6GB/卡——救不了 bf16（需省 4-6GB）；ZeRO-3 分片参数可省 ~3GB 但通信大、与 4bit 组合复杂，对 3B 不值得
+
+### 2.9 训练时间预算：必须基于 time_per_step 实测
+**核心方法**（取代所有凭印象估算）：
+1. 冒烟跑 N 步（≥ logging_steps），看 summary 的 `train_runtime` / `train_steps_per_second`
+2. 算 `time_per_step = train_runtime / N`
+3. 正式总时间 = `总步数 × time_per_step`
+4. 总步数 = `总token / (max_len × per_device_batch × 双卡数)`
+
+**实测教训（不同硬件严重错估）**：
+- T4 16GB：3B bf16 装不下（11.94GB 加载后已满）→ 只能 4bit
+- P100 / T4 4bit 0.5B 2048 单卡：~15s/步（极慢，4bit dequant 在弱 TC 上开销大）
+- **A100 PCIe 40GB 3B 4bit 2048 双卡：~3.2s/步**（用户实测）
+- A100 40GB 可装 bf16 3B（之前 T4 上的所有 4bit 妥协在 A100 上不再必要）
+
+**对正式 Stage 1 的预算（A100 双卡 3.2s/步）**：
+- 23.6 万条 + 1024 = ~6900 步 × 3.2s ≈ **6.1 小时**（仍超 12h commit → 抽样）
+- 10 万条 + 1024 = ~2900 步 ≈ **2.6 小时** ✓
+- 5000 条 + 1024 = ~1450 步 ≈ **1.3 小时**（消融够用）
+
+**根本教训**：所有"几分钟/几小时"的预算必须从实测 time_per_step 推算，不能凭印象凭 GPU 规格拍脑袋。

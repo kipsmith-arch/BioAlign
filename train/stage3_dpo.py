@@ -143,7 +143,10 @@ def main():
     setup_env()
     setup_output_dir(args.output_dir)
 
-    print(f"[Stage3] 加载 base: {args.model_path} + stage2 adapter: {args.stage2_dir}")
+    # 所有诊断 print 只在主进程输出，避免 DDP 双进程重复日志
+    IS_MAIN = int(os.environ.get("LOCAL_RANK", "0")) == 0
+    if IS_MAIN:
+        print(f"[Stage3] 加载 base: {args.model_path} + stage2 adapter: {args.stage2_dir}")
     model, tokenizer = load_model_tokenizer(args.model_path, args.use_4bit, args.max_len)
     model = PeftModel.from_pretrained(model, args.stage2_dir)   # 可训练（更新 stage2 adapter）
     # peft 加载后 LoRA 参数 requires_grad 默认 False，显式启用
@@ -156,7 +159,8 @@ def main():
     model.train()
 
     rows = read_jsonl(f"{args.data_dir}/{args.dpo_data}", args.max_samples)
-    print(f"[Stage3] DPO 数据: {len(rows)} 对")
+    if IS_MAIN:
+        print(f"[Stage3] DPO 数据: {len(rows)} 对")
     dataset = Dataset.from_list(
         [encode_pair(r, tokenizer, args.max_len, SYSTEM_PROMPT) for r in rows])
     dataset = dataset.filter(lambda x: len(x["chosen_input_ids"]) > 0
@@ -172,6 +176,8 @@ def main():
         bf16=True,
         logging_steps=25,
         disable_tqdm=True,
+        log_on_each_node=False,
+        label_names=[],
         save_strategy="steps",
         save_steps=args.max_steps if args.max_steps > 0 else 200,
         save_total_limit=2,
@@ -186,12 +192,15 @@ def main():
         tokenizer=tokenizer, data_collator=DPODataCollator(tokenizer),
     )
     trainer.add_callback(ProgressCallback())
-    print("[Stage3] 开始 DPO 训练 ...")
+    if IS_MAIN:
+        print("[Stage3] 开始 DPO 训练 ...")
     trainer.train()
-    print(f"[Stage3] 保存 adapter 到 {args.output_dir}")
+    if IS_MAIN:
+        print(f"[Stage3] 保存 adapter 到 {args.output_dir}")
     trainer.model.save_pretrained(args.output_dir)
     tokenizer.save_pretrained(args.output_dir)
-    print("[Stage3] 完成。")
+    if IS_MAIN:
+        print("[Stage3] 完成。")
 
 
 if __name__ == "__main__":
