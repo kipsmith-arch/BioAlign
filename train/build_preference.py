@@ -30,6 +30,7 @@ build_preference.py —— 自构 DPO 偏好数据（方案 A）
 import argparse
 import json
 import sys
+import os
 
 import torch
 from peft import PeftModel

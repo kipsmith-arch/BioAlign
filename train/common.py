@@ -32,8 +32,8 @@ SYSTEM_PROMPT = (
 
 
 def setup_env():
-    """训练环境清理：消除 Kaggle Debugger 重复警告、tokenizer 并行警告、checkpoint shards 重复。
-    必须在任何 transformers/torch 导入前调用。"""
+    """训练环境清理：消除 Kaggle Debugger 重复警告、tokenizer 并行警告、checkpoint shards 重复、
+    DDP 进程组未关闭警告。必须在任何 transformers/torch 导入前调用。"""
     os.environ.setdefault("PYDEVD_DISABLE_FILE_VALIDATION", "1")
     os.environ.setdefault("TOKENIZERS_PARALLELISM", "false")
     # 降低 transformers/peft 库的日志级别，避免 DDP 多卡重复打印 "Loading checkpoint shards..." 等
@@ -41,6 +41,17 @@ def setup_env():
     for name in ("transformers.modeling_utils", "transformers.tokenization_utils_base",
                  "transformers.trainer", "peft", "peft.utils", "peft.tuners.tuners_utils"):
         logging.getLogger(name).setLevel(logging.WARNING)
+    # 注册 DDP 进程组清理函数：异常退出（OOM 强杀/KeyboardInterrupt）时也能执行
+    # 消除 "destroy_process_group() was not called before program exit" 警告
+    import atexit
+    import torch.distributed as dist
+    def _cleanup_pg():
+        if dist.is_initialized():
+            try:
+                dist.destroy_process_group()
+            except Exception:
+                pass
+    atexit.register(_cleanup_pg)
 
 
 class ProgressCallback(TrainerCallback):
