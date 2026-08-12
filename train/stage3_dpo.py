@@ -140,6 +140,8 @@ def main():
     parser.add_argument("--stage2_dir", type=str, required=True, help="Stage 2 的 adapter 目录")
     parser.add_argument("--beta", type=float, default=0.1)
     parser.add_argument("--dpo_data", type=str, default="dpo_pairs.jsonl")
+    # Stage 3 DPO 默认 max_len=768：4 卡 7B DPO 1024 序列 + 双模型 + chosen/rejected 激活太大，768 更稳
+    parser.set_defaults(max_len=768)
     args = parser.parse_args()
     setup_env()
     setup_output_dir(args.output_dir)
@@ -157,6 +159,9 @@ def main():
     # 参考模型：与 model 相同初始化，单独实例、全冻结
     ref_base, _ = load_model_tokenizer(args.model_path, args.use_4bit, args.max_len)
     ref_model = PeftModel.from_pretrained(ref_base, args.stage2_dir)
+    # 显式开 grad checkpoint：DPO 激活是 model+ref 双重 + chosen+rejected 两序列 × 1024 序列，显存大头
+    model.gradient_checkpointing_enable()
+    ref_model.gradient_checkpointing_enable()
     model.train()
 
     rows = read_jsonl(f"{args.data_dir}/{args.dpo_data}", args.max_samples)
@@ -190,7 +195,7 @@ def main():
     trainer = DPOTrainer(
         model=model, ref_model=ref_model, beta=args.beta,
         args=train_args, train_dataset=dataset,
-        tokenizer=tokenizer, data_collator=DPODataCollator(tokenizer),
+        processing_class=tokenizer, data_collator=DPODataCollator(tokenizer),
     )
     trainer.add_callback(ProgressCallback())
     if IS_MAIN:

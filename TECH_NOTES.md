@@ -148,3 +148,88 @@ for n, p in model.named_parameters():
 - 5000 条 + 1024 = ~1450 步 ≈ **1.3 小时**（消融够用）
 
 **根本教训**：所有"几分钟/几小时"的预算必须从实测 time_per_step 推算，不能凭印象凭 GPU 规格拍脑袋。
+
+### 2.10 基于数据选超参（反对拍脑袋）
+**原则**：任何影响数据利用的关键超参（max_len、batch、cap 比例、per-task 配额）都应**先跑数据分布脚本再定**，而不是凭印象。
+
+**本项目实践（`06_token_len_stats.py`）**：
+- 实测 SFT 1 万条 token 长度：p50=228、p95=614、max=1544
+- max_len 覆盖表：768 覆盖 99.5%、1024 覆盖 99.9%（差异 0.4%，但 1024 多花 25% 显存）
+- **选型**基于数据：Stage 1/2 用 1024，Stage 3 用 768（DPO 双模型激活×4 显存压力）
+
+**反对拍脑袋的反面案例**：
+- 我曾"显存不够就改 max_len=768"，这是拍脑袋（恰好数据上 768 合理，但论证方式错误）
+- 之前所有"time_per_step 估算"也是拍脑袋——A100 实测 3.2s/步才纠正了 T4 外推 3-6h 的错误
+
+**面试可讲**：选超参的标准是"先看数据分布 → 选型 → 实测验证"，不是凭直觉或硬件规格。
+
+---
+
+## 3. DPO 与 gradient checkpointing 原理（Stage 3 必备知识）
+
+### 3.1 DPO 为什么需要"两个模型"
+
+**损失函数**（Rafailov et al. 2023）：
+
+```
+L_DPO = -E[ log σ( β · ( (log π(y_c|x) − log π_ref(y_c|x)) − (log π(y_r|x) − log π_ref(y_r|x)) ) ) ]
+```
+
+四个对数似然项：**π** = 当前训练模型，**π_ref** = 参考模型，y_c/y_r = chosen/rejected。
+
+**为什么要 π_ref（关键）**：
+- 没有 ref：模型只让 chosen 似然增大、rejected 减小 → 退化成 SFT/负样本训练，**丧失偏好的相对性**
+- 有 ref：模型学的是 **chosen 相对 ref 增长** vs **rejected 相对 ref 增长** 的差值 → "相对偏好"
+
+**"两个模型"实际是什么**：
+- **同一权重的两份副本**：model 和 ref_model 初始权重相同（都从 stage2 adapter 加载）
+- model 训练中更新（LoRA 梯度），ref 训练中**完全冻结**（`requires_grad_(False)`）
+- ref 锁定"训练前的偏好基线"，DPO 学的是相对这个基线的差值
+
+**DPO 比 SFT 多做 3 次前向**：
+```
+SFT: 1× 前向（输入 → chosen 答案）
+DPO: 4× 前向（π×chosen + π×rejected + π_ref×chosen + π_ref×rejected）
+```
+- **时间代价** ~2x（单次前向 + logp + backward 翻倍）
+- **显存代价** ~2-3x（激活存两份，chosen/rejected 各一份 × 2 模型 = 4× 激活峰值）
+- **本项目实测**：7B 4bit 1024 DPO 不开 checkpoint OOM（~27-30GB/卡），开 checkpoint 后 ~18-22GB/卡 ✓
+
+**本项目实现**（`stage3_dpo.py`）：
+```python
+model = PeftModel.from_pretrained(base, stage2_dir)   # 训练副本
+ref_model = PeftModel.from_pretrained(ref_base, stage2_dir)  # 冻结副本
+for p in ref_model.parameters():
+    p.requires_grad_(False)   # ref 全冻结
+```
+
+### 3.2 gradient checkpointing 是什么、为什么有效
+
+**问题**：反向传播需要前向时**每层保存的激活张量**。大模型 + 长序列 → 激活 O(层数 × seq × hidden) 巨大。
+
+**解决思路**：**前向时不全存，反向时重算**：
+
+```
+普通前向:   layer1→[act1]→layer2→[act1,act2]→...→layerN→[act1..N]  → 反向用这些
+checkpoint:  layer1→[act1]→丢,layer2→[act2]→丢,...→layerN→[actN]  → 反向时从 actN 重新前向算 act1..N-1
+```
+
+**代价与收益**：
+| 维度 | 普通 | checkpoint |
+|---|---|---|
+| 显存（激活） | 存 N 层 | **只存 1 层**（降一个量级） |
+| 时间 | 1× 前向 | **~1.33× 前向**（反向时多算 1 次） |
+
+**为什么 DPO 特别需要**：
+- 普通 SFT：1 序列前向，激活 ×1
+- DPO：chosen + rejected 两个序列 × 2 模型 = **激活 ×4**
+- 不开 checkpoint：7B 4bit 1024 DPO 双模型激活 = 单 SFT 的 4 倍，~27-30GB/卡 → OOM
+- 开 checkpoint：激活降一个量级 → ~18-22GB/卡 ✓
+
+`model.gradient_checkpointing_enable()`（Trainer 模型通用 API，DPO 需对 `model` 和 `ref_model` 都调一次）就是告诉模型"前向不全存激活、反向重算"。
+
+### 3.3 面试可讲的一句话
+
+- **DPO 双模型**：同一权重的两份副本（一份训练、一份冻结作参考基线），实现"相对偏好"学习；4 次前向导致激活 ×4
+- **gradient checkpointing**：用时间换显存，前向不全存激活、反向时重算，激活降约一个量级、训练慢约 33%
+- **两者结合**：DPO 激活 ×4 必须开 checkpoint，否则大模型 DPO 必爆显存

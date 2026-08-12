@@ -32,10 +32,15 @@ SYSTEM_PROMPT = (
 
 
 def setup_env():
-    """训练环境清理：消除 Kaggle Debugger 重复警告、tokenizer 并行警告。
+    """训练环境清理：消除 Kaggle Debugger 重复警告、tokenizer 并行警告、checkpoint shards 重复。
     必须在任何 transformers/torch 导入前调用。"""
     os.environ.setdefault("PYDEVD_DISABLE_FILE_VALIDATION", "1")
     os.environ.setdefault("TOKENIZERS_PARALLELISM", "false")
+    # 降低 transformers/peft 库的日志级别，避免 DDP 多卡重复打印 "Loading checkpoint shards..." 等
+    import logging
+    for name in ("transformers.modeling_utils", "transformers.tokenization_utils_base",
+                 "transformers.trainer", "peft", "peft.utils", "peft.tuners.tuners_utils"):
+        logging.getLogger(name).setLevel(logging.WARNING)
 
 
 class ProgressCallback(TrainerCallback):

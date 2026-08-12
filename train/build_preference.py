@@ -58,14 +58,16 @@ def main():
         args.output_dir = args.data_dir
         print(f"[Pref] --output_dir 未传，默认 = --data_dir = {args.output_dir}")
     sys.stdout.reconfigure(encoding="utf-8")
-
-    print(f"[Pref] 加载 base: {args.model_path} + stage2 adapter: {args.stage2_dir}（生成 rejected 用）")
+    IS_MAIN = int(os.environ.get("LOCAL_RANK", "0")) == 0
+    if IS_MAIN:
+        print(f"[Pref] 加载 base: {args.model_path} + stage2 adapter: {args.stage2_dir}（生成 rejected 用）")
     model, tokenizer = load_model_tokenizer(args.model_path, args.use_4bit, args.max_len)
     model = PeftModel.from_pretrained(model, args.stage2_dir)
     model.eval()
 
     rows = read_jsonl(f"{args.data_dir}/{args.in_file}", args.max_pairs)
-    print(f"[Pref] 读取 {args.in_file}: {len(rows)} 条")
+    if IS_MAIN:
+        print(f"[Pref] 读取 {args.in_file}: {len(rows)} 条")
 
     out_path = f"{args.output_dir}/{args.out_file}"
     written, skipped = 0, 0
@@ -104,9 +106,11 @@ def main():
             }, ensure_ascii=False) + "\n")
             written += 1
             if (i + 1) % 50 == 0:
-                print(f"  已处理 {i+1}/{len(rows)}，有效 {written}，跳过 {skipped}")
+                if IS_MAIN:
+                    print(f"  已处理 {i+1}/{len(rows)}，有效 {written}，跳过 {skipped}")
 
-    print(f"[Pref] 完成: 写入 {written} 对 -> {out_path}（跳过 {skipped}）")
+    if IS_MAIN:
+        print(f"[Pref] 完成: 写入 {written} 对 -> {out_path}（跳过 {skipped}）")
 
 
 if __name__ == "__main__":

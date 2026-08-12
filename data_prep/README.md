@@ -103,6 +103,38 @@ stage3.xlsx（8,002 条 GPT-4o-mini 精修的**推理型**长答案）转 jsonl�
 2. **小 task 训练配额可能很少**：极小 task（如 tf-m-3 仅 8 条）几乎全部进入评估/DPO，训练中近乎无样本——这是"评估优先"的代价，可接受（这些任务在评估中仍可测，训练覆盖率问题由 cap 逻辑缓解）。
 3. **GRCh38 片段未做低复杂度/重复区域屏蔽**：随机切片段天然包含基因间区/重复区（与论文做法一致，论文同样直接切 2000 字符）。
 
+### 3.5 token 长度统计与 max_len 选取（scripts/06_token_len_stats.py）
+
+**目的**：避免"拍脑袋选 max_len"，基于 SFT 数据实际长度分布决定。
+
+**实测（n=10000，Qwen2.5 tokenizer + ChatML 模板）**：
+
+| 分位 | SFT total token | SFT output token |
+|---|---|---|
+| p50 | 228 | 17 |
+| p75 | 341 | 21 |
+| p90 | 544 | 28 |
+| p95 | 614 | 39 |
+| p99 | 711 | 438 |
+| max | 1544 | 959 |
+| mean | 274 | 29 |
+
+**max_len 覆盖表**（不截断比例）：
+
+| max_len | 保留率 | 截断 | 说明 |
+|---|---|---|---|
+| 512 | 86.8% | 13.2% | ❌ 损失大 |
+| **768** | **99.5%** | 0.5%（50/万） | ✅ 平衡选择 |
+| **1024** | **99.9%** | 0.1%（10/万） | ✅ 数据更完整，显存多 25% |
+| 1280 | 99.9% | 同 1024 | 显存多不增覆盖，不推荐 |
+
+**本项目选型**：
+- **Stage 1（packing）** max_len=1024：packing 是块大小，截断仅丢尾部碎片，无数据损失
+- **Stage 2（SFT）** max_len=1024：A100 显存足够，99.9% 不截断
+- **Stage 3（DPO）** max_len=768：DPO 双模型×双序列激活×4，显存压力大；768 损失 0.5% 数据换 25% 显存，trade-off 合理
+
+**结论**：拍脑袋选超参是反模式——下次任何超参（max_len、batch、cap 比例）都应先跑数据分布脚本再定。
+
 ## 5. 面试问答准备
 
 - **Q: 为什么不平衡采样？** A: 论文消融实验证明平衡采样导致下游指标下降（扭曲真实生物学分布）；采用分层 + cap。
@@ -112,6 +144,8 @@ stage3.xlsx（8,002 条 GPT-4o-mini 精修的**推理型**长答案）转 jsonl�
 - **Q: 序列长度为什么 512~2000？** A: 论文上限 2000 字符（≈1200 token）；Kaggle 资源下缩短到 512 起步，片长随机以覆盖不同尺度模式。
 - **Q: 数据量为什么是论文的 1/10~1/20？** A: 硬件约束（24×A100 1.5 天 vs T4×2 数小时）；数据下载与论文同源，训练抽样按资源压缩，消融实验证明方向性结论仍成立。
 - **Q: 15 万条 SFT 数据量够吗？有量化依据吗？** A: **诚实回答：没有先验量化依据**。曾提出"token 数远超可训练参数数所以够"的论据，经核对是不成立的——该比例与 Chinchilla scaling law（预训练最优 token≈20×参数）方向相反，且 Chinchilla 仅适用于从零预训练，不适用于 SFT。15 万条是资源约束下的工程选择，落在社区 SFT 规模范围内（LIMA 仅 1k 条、Alpaca 52k 条，均非定律）；"低秩 LoRA → 数据需求低"亦无文献严格支撑。**充分性的正确验证方式是实验**：① 训练 loss 曲线（不降→欠拟合，加数据/epoch/rank）；② eval 指标 vs 基线（基座零样本、论文 SOTA）；③ 数据量消融（改 `TRAIN_TOTAL_TARGET` 重跑 `01_split_stage2.py`，几分钟生成 20-30 万条训练集，直接测边际效应）。
+
+- **Q: max_len 怎么选？** A: 不拍脑袋——先跑 `06_token_len_stats.py` 统计 SFT 实际长度分布。**本项目实测**（1 万条 + Qwen tokenizer + ChatML）：p50=228、p95=614、max=1544。max_len=768 覆盖 99.5% 样本，max_len=1024 覆盖 99.9%——差异仅 0.4%，但 1024 比 768 多花 25% 显存。**选型逻辑**：Stage 1（packing 是块大小，无数据损失）用 1024；Stage 2（SFT）用 1024（99.9% 不截断）；Stage 3（DPO 双模型×双序列激活×4，显存压力大）用 768 损失 0.5% 数据换 25% 显存。
 
 - **Q: 模板同质化怎么应对？** A: 诊断先行——按 task 提取模板骨架（挖掉序列的问题句式），实测每 task 仅 50~200 个模板、头部模板重复套用几十~几百条序列。应对：① 完全去重；② 模板感知均衡采样（每模板 cap = max(50, ceil(avg×mult))）；③ 合并 stage3 高信息密度长答案。效果：Top5 模板占比 2.0%→1.3%。附发现：stage2 的序列标签是非标准闭合 `<rna>...<rna>`（无斜杠），模板提取正则已适配。
 
@@ -124,6 +158,7 @@ python -X utf8 scripts/02_stage3_convert.py   # 需要 ../dataset/stage3.xlsx
 python -X utf8 scripts/03_seq_prepare.py      # 需要 ../seq/*.fasta/.fna
 python -X utf8 scripts/05_dedup_template.py   # 需要 output/train_pool.jsonl + stage3.jsonl
 python -X utf8 scripts/04_smoke.py            # 需要 output/train_pool.jsonl
+python -X utf8 scripts/06_token_len_stats.py  # 统计 SFT/DPO 实际 token 长度→选 max_len（需设 TOK_PATH）
 ```
 
 所有脚本固定 `SEED=42`，重跑结果一致。
