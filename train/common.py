@@ -42,6 +42,18 @@ def setup_env():
     for name in ("transformers.modeling_utils", "transformers.tokenization_utils_base",
                  "transformers.trainer", "peft", "peft.utils", "peft.tuners.tuners_utils"):
         logging.getLogger(name).setLevel(logging.WARNING)
+    # Monkey-patch torch.utils.checkpoint.checkpoint 自动补 use_reentrant=False：
+    # PyTorch 2.5 强制要求传 use_reentrant，否则每个 forward step 都报 deprecation 警告。
+    # transformers 内部旧代码调 checkpoint() 没传 use_reentrant——monkey-patch 根因消除（不是抑制 warnings）
+    import torch.utils.checkpoint as _ckpt_mod
+    if not getattr(_ckpt_mod.checkpoint, "_patched_use_reentrant", False):
+        _orig_ckpt = _ckpt_mod.checkpoint
+        def _ckpt_patched(function, *args, **kwargs):
+            if "use_reentrant" not in kwargs:
+                kwargs["use_reentrant"] = False
+            return _orig_ckpt(function, *args, **kwargs)
+        _ckpt_patched._patched_use_reentrant = True
+        _ckpt_mod.checkpoint = _ckpt_patched
     # 注册 DDP 进程组清理函数：异常退出（OOM 强杀/KeyboardInterrupt）时也能执行
     # 消除 "destroy_process_group() was not called before program exit" 警告
     import atexit
@@ -195,16 +207,37 @@ def build_lora_plus_optimizer(model, base_lr: float, scaler: float = 4.0, weight
 
 
 def read_jsonl(path: str, max_samples: int = -1):
-    """读取 jsonl，逐条返回 dict 列表。"""
+    """读取 jsonl，逐条返回 dict 列表。捕获 JSONDecodeError 给出明确错误信息（文件路径 + 前 200 字节内容），
+    帮助排查"空文件/损坏文件/路径错"等问题。"""
+    import os
     out = []
+    if not os.path.exists(path):
+        raise FileNotFoundError(f"read_jsonl: 文件不存在 → {path}")
+    size = os.path.getsize(path)
+    if size == 0:
+        raise ValueError(f"read_jsonl: 文件为空（0 字节）→ {path}\n"
+                         f"提示：build_preference 写出的文件是否被中断？或 --dpo_data 路径写错？")
     with open(path, encoding="utf-8") as f:
-        for line in f:
+        for line_num, line in enumerate(f, start=1):
             line = line.strip()
             if not line:
                 continue
-            out.append(json.loads(line))
+            try:
+                out.append(json.loads(line))
+            except json.JSONDecodeError as e:
+                # 给出文件路径 + 前 200 字节内容，定位是损坏还是空行
+                with open(path, "rb") as fb:
+                    head_bytes = fb.read(200)
+                raise ValueError(
+                    f"read_jsonl: JSON 解析失败 → {path}\n"
+                    f"  错误行 {line_num}: {e}\n"
+                    f"  文件前 200 字节: {head_bytes!r}\n"
+                    f"  文件总大小: {size} 字节"
+                )
             if max_samples > 0 and len(out) >= max_samples:
                 break
+    if not out and size > 0:
+        raise ValueError(f"read_jsonl: 文件 {size} 字节但无有效记录（可能全空行）→ {path}")
     return out
 
 
