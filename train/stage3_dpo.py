@@ -40,7 +40,7 @@ from transformers import Trainer, TrainingArguments
 
 sys.path.insert(0, __file__.rsplit("/", 1)[0])
 from common import (ProgressCallback, SYSTEM_PROMPT, add_common_args, load_model_tokenizer,
-                    read_jsonl, setup_env, setup_output_dir)
+                    read_jsonl, setup_env, setup_output_dir, enable_grad_checkpointing)
 
 
 def encode_pair(pair, tokenizer, max_len, system_prompt):
@@ -96,6 +96,9 @@ class DPOTrainer(Trainer):
         # 当前策略 π：分别对 chosen / rejected 前向
         logits_c = model(input_ids=inputs["chosen_input_ids"]).logits
         logits_r = model(input_ids=inputs["rejected_input_ids"]).logits
+        # 保险：确保 logits 在计算图里（防御某些极端路径下 loss 断图）
+        logits_c.requires_grad_(True)
+        logits_r.requires_grad_(True)
         logp_c, _ = token_logprobs(logits_c, inputs["chosen_input_ids"], inputs["chosen_labels"], pad)
         logp_r, _ = token_logprobs(logits_r, inputs["rejected_input_ids"], inputs["rejected_labels"], pad)
 
@@ -160,8 +163,10 @@ def main():
     ref_base, _ = load_model_tokenizer(args.model_path, args.use_4bit, args.max_len)
     ref_model = PeftModel.from_pretrained(ref_base, args.stage2_dir)
     # 显式开 grad checkpoint：DPO 激活是 model+ref 双重 + chosen+rejected 两序列 × 1024 序列，显存大头
-    model.gradient_checkpointing_enable()
-    ref_model.gradient_checkpointing_enable()
+    enable_grad_checkpointing(model)
+    enable_grad_checkpointing(ref_model)
+    # ref 是冻结副本，必须设 eval 模式（避免 DPOTrainer 误判 ref 也可训练、避免 drop/BN 等行为）
+    ref_model.eval()
     model.train()
 
     rows = read_jsonl(f"{args.data_dir}/{args.dpo_data}", args.max_samples)
@@ -190,7 +195,7 @@ def main():
         remove_unused_columns=False,
         seed=args.seed,
         report_to=[],
-        ddp_find_unused_parameters=False,
+        ddp_find_unused_parameters=True,  # DPO 双模型，DDP 同步允许某些参数未参与 loss
     )
     trainer = DPOTrainer(
         model=model, ref_model=ref_model, beta=args.beta,

@@ -89,11 +89,29 @@ bf16 3B：单卡加载后 11.95GB、训练峰值 13GB+ → 单卡/DDP 双卡均�
 ### 2.1 冒烟测试方法论（REPRODUCTION_PLAN.md nb2）
 **只缩数据量/步数，不动超参**（lr/batch/rank/max_len 与正式一致）——冒烟验证的代码路径与正式完全一致，避免"冒烟过了、正式超参没验证"。冒烟不换模型（小数据量冒烟），同一模型同一套代码。
 
-### 2.2 数据并行 vs 模型并行
-- 显存装得下 → **数据并行（DDP）**：每卡完整模型副本、各看不同 batch，吞吐 ×N，每步一次梯度 all-reduce
-- 显存装不下 → **模型并行**：模型拆开（TP 张量切分 / PP 流水线 / ZeRO 分片）
-- **DDP 不减每卡显存**（每卡完整副本，固定开销不摊薄）——只有模型并行/ZeRO 才减单卡显存。**实测教训**：3B bf16 单卡加载后 11.95GB，DDP 双卡每卡同样 11.95GB，训练峰值仍超 14.56GB → bf16 在 T4 上双卡也救不了，只能 4bit
-- 本项目 3B+4bit 单卡 16GB 绰绰有余 → **双卡 DDP 用于提速**（Kaggle 实测双卡扣 1h/1h，白赚速度），代码零改动（LOCAL_RANK 决定 device_map），仅改启动命令 + grad_accum 减半
+### 2.2 张量并行 TP vs 数据并行 DDP
+- **DDP（数据并行）**：每卡完整模型副本、各看不同 batch，吞吐 ×N，每步一次梯度 all-reduce
+- **TP（张量并行）**：把单层权重**切到多卡**（`nn.Linear(in, out)` 切 out 维度：4 卡各拿 1/4 输出，all-gather 汇总）
+- **DDP 不减每卡显存**（每卡完整副本，固定开销不摊薄）——只有 TP/PP/ZeRO 才减单卡显存。**实测教训**：3B bf16 单卡加载后 11.95GB，DDP 双卡每卡同样 11.95GB → bf16 在 T4 上双卡也救不了，只能 4bit
+- 本项目 3B+4bit 单卡 16GB 绰绰有余 → **双卡 DDP 用于提速**（代码零改动，仅改启动命令 + grad_accum 减半）
+
+**TP 规则（`tp_plan`）**：HuggingFace 新模型类声明"如果有人要 TP 这个模型，按这个规则切"——Qwen2 的 tp_plan：
+```python
+{
+  "layers.*.self_attn.q_proj": "colwise",   # 按输出切
+  "layers.*.self_attn.k_proj": "colwise",
+  "layers.*.self_attn.v_proj": "colwise",
+  "layers.*.self_attn.o_proj": "rowwise",   # 按输入切（与 q/k/v 输出对应）
+  "layers.*.mlp.gate_proj": "colwise",
+  "layers.*.mlp.up_proj": "colwise",
+  "layers.*.mlp.down_proj": "rowwise",
+}
+```
+这**只是元数据声明**，不是必须用——accelerate 检查时若"声明了但没应用"会警告。
+
+**accelerate 警告原理**：`check_tp_plan` 检测到模型 `tp_plan` 有规则、但 `device_map` 加载方式没应用 → 报"The following TP rules were not applied"。**真修（不抑制日志）**：清空 `model._tp_plan` 和 `model.config._tp_plan` = 告诉 accelerate "我们不打算做 TP"（项目用 DDP 不 TP，3B/7B 4bit 单卡够），accelerate 找不到规则 → 不警告。清空不影响模型功能。
+
+**为什么我们不用 TP**：3B/7B 4bit 单卡显存足够（DDP 简单 + 容错好），TP 通信密集（每层 all-gather）需要 NVLink 等高速互联才能高效，PCIe/Kaggle 上不划算。
 
 ### 2.3 数据量充分性：没有先验量化依据（data_prep/README.md 面试问答）
 - "token 数 > 参数数 所以够"的论据**不成立**（与 Chinchilla 方向相反，且 Chinchilla 仅适用于从零预训练）
@@ -162,6 +180,56 @@ for n, p in model.named_parameters():
 - 之前所有"time_per_step 估算"也是拍脑袋——A100 实测 3.2s/步才纠正了 T4 外推 3-6h 的错误
 
 **面试可讲**：选超参的标准是"先看数据分布 → 选型 → 实测验证"，不是凭直觉或硬件规格。
+
+### 2.11 为什么 TP 按张量切（设计原理与取舍）
+
+**核心动机**：单层能装下、整个模型装不下。**只**按层切不够——优化器状态本身就能超：
+
+| 模型 | 单层最大 Linear | 优化器状态（Adam fp32） | 单卡够装吗？ |
+|---|---|---|---|
+| LLaMA-7B | 4096×4096 × 2B = 32MB | 7B × 8B = 56GB | A100 80GB 勉强 |
+| LLaMA-70B | 8192×8192 × 2B = 128MB | 70B × 8B = **560GB** | ❌ |
+| GPT-3 175B | 12288×12288 × 2B = 600MB | 175B × 8B = **1.4TB** | ❌ |
+
+**单层不是问题，整个模型+梯度+优化器+激活才是**——70B 仅优化器就 560GB（远超 80GB A100），必须拆参数本身。
+
+**两种切法对比**：
+
+| | PP（按层切） | TP（按张量切） |
+|---|---|---|
+| 切什么 | 不同层放不同卡 | 单层权重切到多卡 |
+| 设备利用率 | 1/N（其他卡等下一层）| **1**（每层所有卡同时算）|
+| 通信 | 层间一次（activation，BLH/N）| 每层 all-reduce（BLH）|
+| 计算 | 层间**串行**（必须按顺序）| 层内**并行**（同时算）|
+| Pipeline bubble | 有（首尾空闲）| 无 |
+| 拓扑要求 | 慢速互联可 | **需高速互联**（NVLink 900GB/s）|
+| 适用 | 极深模型 | 宽模型（单层宽）|
+
+**TP 三大优势**：
+1. **设备利用率 = 1**（vs PP 的 1/N）：每层所有卡都工作
+2. **无 pipeline bubble**：每层 all-reduce 后立即进入下一层
+3. **计算/通信重叠**：TP 的 all-reduce 可与下一层 matmul 用不同 CUDA stream 并行执行，通信被计算"掩藅"（实际开销更低）
+
+**代价（担忧是对的）**：
+- 每个 Linear 要写并行版本（Megatron `ColumnParallelLinear` / `RowParallelLinear` 约 500 行 + 严格处理 q/k/v colwise ↔ o proj rowwise 的对应切分，否则 all-reduce 错位）
+- 通信密集，需 NVLink/NVSwitch（PCIe 30GB/s 上 70B TP 会慢 10x）
+- 框架集成复杂（accelerate TP 实验性 / NeMo / TransformerEngine）
+- 调试困难（bug 表现为 loss 错 / NaN / 慢，难定位）
+- **这正是 HuggingFace 引入 `tp_plan` 的原因**：模型作者声明"这些层按这个规则切"，accelerate 加载时按规则切——用户不用手写
+
+**大模型必须 TP×PP 组合**（两者优点互补）：
+```
+GPT-3 175B 训练 1024 张 A100 = 16 段 PP × 每段 8-way TP × 每段 1 个 layer
+LLaMA-70B 训练 2048 张 A100 = 16×16 组合
+```
+
+**本项目不用 TP 的理由**（项目选型逻辑）：
+- 3B/7B 4bit 单卡装得下（3.5-4GB），不需要拆
+- TP 复杂度高、调试难、对框架要求高
+- Kaggle T4 **无 NVLink**（只有 PCIe），TP 通信会拖垮训练
+- 项目目标："流程跑通 + 消融对比"，DDP 简单 + 容错好 + 满足需求
+
+**面试可讲**：为什么"按张量切"而不是"按层切"——单卡装不下整个模型（优化器状态就超），但单层装得下，所以切单层权重到多卡并行算 → 设备利用率 1、无气泡、通信可重叠，代价是每层要写并行版本 + 需高速互联。大模型必须 TP×PP 组合，本项目 3B/7B 单卡够 + Kaggle 无 NVLink → 选 DDP。
 
 ---
 

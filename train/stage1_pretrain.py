@@ -30,7 +30,7 @@ from transformers import Trainer, TrainingArguments
 
 sys.path.insert(0, __file__.rsplit("/", 1)[0])
 from common import (ProgressCallback, add_common_args, add_lora, build_lora_plus_optimizer,
-                    load_model_tokenizer, read_jsonl, setup_env, setup_output_dir)
+                    load_model_tokenizer, read_jsonl, setup_env, setup_output_dir, enable_grad_checkpointing)
 
 
 def pack_texts(texts, tokenizer, max_len):
@@ -70,7 +70,7 @@ def main():
     model = add_lora(model, r=args.lora_r, alpha=args.lora_alpha,
                      dropout=args.lora_dropout, train_norm=args.train_norm)
     # 显式开启 gradient checkpointing（bf16 3B 长序列下激活是显存大头）
-    model.gradient_checkpointing_enable()
+    enable_grad_checkpointing(model)
     if torch.cuda.is_available() and IS_MAIN:
         trainable = sum(p.numel() for p in model.parameters() if p.requires_grad)
         # 新版 transformers 属性名为 is_gradient_checkpointing（旧版 gradient_checkpointing）

@@ -36,7 +36,8 @@ def setup_env():
     DDP 进程组未关闭警告。必须在任何 transformers/torch 导入前调用。"""
     os.environ.setdefault("PYDEVD_DISABLE_FILE_VALIDATION", "1")
     os.environ.setdefault("TOKENIZERS_PARALLELISM", "false")
-    # 降低 transformers/peft 库的日志级别，避免 DDP 多卡重复打印 "Loading checkpoint shards..." 等
+    # 降低 transformers/peft 库的日志级别（避免 "Loading checkpoint shards" 等重复噪音）
+    # 注意：accelerate 的 TP warnings 不抑制——那是真问题，需在加载后清空 _tp_plan
     import logging
     for name in ("transformers.modeling_utils", "transformers.tokenization_utils_base",
                  "transformers.trainer", "peft", "peft.utils", "peft.tuners.tuners_utils"):
@@ -133,7 +134,21 @@ def load_model_tokenizer(model_path: str, use_4bit: bool = True, max_len: int = 
             model_path, torch_dtype=torch.bfloat16,
             device_map=device_map, trust_remote_code=True)
     model.config.use_cache = False
+    # 真修 TP warnings：accelerate 的 check_tp_plan 检测到模型有 TP 规则但我们用 DDP/device_map 不应用
+    # 清空模型 _tp_plan / config._tp_plan = 告诉 accelerate "我们不打算做 TP"（根因消除，非抑制日志）
+    for attr in ("_tp_plan",):
+        if hasattr(model, attr):
+            setattr(model, attr, None)
+    if hasattr(model.config, "_tp_plan"):
+        model.config._tp_plan = None
     return model, tokenizer
+
+
+def enable_grad_checkpointing(model):
+    """统一开启 grad checkpoint，显式传 use_reentrant=False（消除 PyTorch 2.5+ 警告）"""
+    if hasattr(model, "gradient_checkpointing_enable"):
+        model.gradient_checkpointing_enable(
+            gradient_checkpointing_kwargs={"use_reentrant": False})
 
 
 def add_lora(model, r: int = 16, alpha: int = 32, dropout: float = 0.05, train_norm: bool = False):
