@@ -41,14 +41,22 @@ from common import SYSTEM_PROMPT, add_common_args, load_model_tokenizer, read_js
 def main():
     parser = argparse.ArgumentParser()
     add_common_args(parser)
+    # build_preference 覆藇 common 的 --output_dir required 默认 = --data_dir
+    # （让 stage3 能在同目录下找到 dpo_pairs.jsonl，避免忘填跳坑）
+    parser.set_defaults(output_dir=None)
     parser.add_argument("--stage2_dir", type=str, required=True,
                         help="Stage 2 模型 adapter（生成 rejected 用，on-policy）")
+    # output_dir 不再用 common 的 required，改用下面的默认（=data_dir），避免忘填
     parser.add_argument("--max_pairs", type=int, default=25000, help="构造偏好对数量")
     parser.add_argument("--max_new_tokens", type=int, default=96)
     parser.add_argument("--temperature", type=float, default=0.9)
     parser.add_argument("--in_file", type=str, default="dpo_source.jsonl")
     parser.add_argument("--out_file", type=str, default="dpo_pairs.jsonl")
     args = parser.parse_args()
+    # 默认 = data_dir（与 stage3_dpo --data_dir 一致，能在同目录找到产出）
+    if args.output_dir is None:
+        args.output_dir = args.data_dir
+        print(f"[Pref] --output_dir 未传，默认 = --data_dir = {args.output_dir}")
     sys.stdout.reconfigure(encoding="utf-8")
 
     print(f"[Pref] 加载 base: {args.model_path} + stage2 adapter: {args.stage2_dir}（生成 rejected 用）")
