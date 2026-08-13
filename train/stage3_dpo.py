@@ -54,8 +54,8 @@ def encode_pair(pair, tokenizer, max_len, system_prompt):
         full_text = tokenizer.apply_chat_template(msgs, tokenize=False, add_generation_prompt=False)
         prompt_text = tokenizer.apply_chat_template(
             msgs[:-1], tokenize=False, add_generation_prompt=True)
-        ids_full = tokenizer.encode(full_text, add_special_tokens=False)
-        ids_prompt = tokenizer.encode(prompt_text, add_special_tokens=False)
+        ids_full = tokenizer.encode(full_text, add_special_tokens=False, max_length=max_len, truncation=False)
+        ids_prompt = tokenizer.encode(prompt_text, add_special_tokens=False, max_length=max_len, truncation=False)
         if len(ids_full) > max_len:
             ids_full = ids_full[:max_len]
         n_prompt = min(len(ids_prompt), len(ids_full))

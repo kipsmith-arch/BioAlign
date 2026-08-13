@@ -50,8 +50,8 @@ train_pool_clean 净化：去重 + 模板均衡采样（每模板 cap，Top5 模
 | 1 | Stage 1 继续预训练 | 23.6万（全量） | 4-5h | ckpt/stage1 |
 | 2 | Stage 2 分支 A (stage2-only) | 28.98万（全量） | 5-6h | ckpt/stage2_only |
 | 3 | Stage 2 分支 B (stage1+stage2) | 28.98万（全量） | 5-6h | ckpt/stage2_s1 |
-| 4 | build_preference | 2.5万对（dpo_source 抽样） | 4-5h | dpo_pairs.jsonl |
-| 5 | Stage 3 DPO | 2.5万对 | 1.5-2h | ckpt/stage3 |
+| 4 | build_preference（**用 stage2_s1**） | 2.5万对（dpo_source 抽样） | 4-5h | dpo_pairs.jsonl |
+| 5 | Stage 3 DPO（**起始 stage2_s1**） | 2.5万对 | 1.5-2h | ckpt/stage3 |
 | 6 | 评估 4 档（前 2 档） | 1.89万 × 2 + batch gen | 6-7h | eval_base / eval_s2_only |
 | 7 | 评估 4 档（后 2 档） | 1.89万 × 2 + batch gen | 6-7h | eval_s1_s2 / eval_stage3 |
 | **合计** | | | **34-40h, 9 晚** | |
@@ -84,11 +84,11 @@ torchrun --nproc_per_node=4 $CODE_DIR/stage1_pretrain.py \
   --max_len 1024 --max_steps 30 --max_samples 200 \
   --per_device_batch 4 --grad_accum 4
 
-# Step 2: Stage 2 冒烟（60 步，100 条）
+# Step 2: Stage 2 冒烟（60 步，100 条，max_len 与正式一致 2048——验证长序列代码路径与显存）
 torchrun --nproc_per_node=4 $CODE_DIR/stage2_sft.py \
   --model_path $MODEL_7B --data_dir $DATA_DIR \
   --output_dir $WORK_DIR/ckpt/stage2_smoke \
-  --max_len 1024 --max_steps 60 --max_samples 100 \
+  --max_len 2048 --max_steps 60 --max_samples 100 \
   --per_device_batch 4 --grad_accum 4
 
 # Step 3: build_preference 冒烟（50 pairs，4 卡已加 sharding）
@@ -154,7 +154,7 @@ torchrun --nproc_per_node=4 $CODE_DIR/stage2_sft.py \
 - max_len 2048：bio 长序列 tail 留 headroom
 - 4528 步 × 4.1s ≈ 5.2h
 
-**产出**：ckpt/stage2_only → **下载作为晚 4 / 晚 6 input**
+**产出**：ckpt/stage2_only → **下载作为晚 6 评估 input**（只为消融①对比，**不再给 DPO 流水线使用**）
 
 ### 晚 3：Stage 2 分支 B — stage1+stage2（commit 5-6h）
 
@@ -182,7 +182,7 @@ torchrun --nproc_per_node=4 $CODE_DIR/stage2_sft.py \
 
 ```bash
 torchrun --nproc_per_node=4 $CODE_DIR/build_preference.py \
-  --model_path $MODEL_7B --stage2_dir /path/to/stage2-only-adapter \
+  --model_path $MODEL_7B --stage2_dir /path/to/stage2-s1-adapter \
   --data_dir $DATA_DIR \
   --output_dir $WORK_DIR \
   --max_pairs 25000 \
@@ -192,7 +192,7 @@ torchrun --nproc_per_node=4 $CODE_DIR/build_preference.py \
 **配置说明**：
 - 2.5万对从 11.2万 dpo_source 抽样（脚本内部按顺序取前 25000）
 - 4 卡 sharding：6250/卡 × ~2.5s ≈ 4.3h
-- on-policy 语义：rejected 用 stage2-only（不是 stage2_s1，避免偏好含 Stage 1 信息污染）
+- **路径 B（推荐）：rejected 用 stage2_s1**（path B——pipeline 沿 stage2_s1起点，部署场景一致；stage2_only 仍训练仅为消融①）
 
 **产出**：dpo_pairs.jsonl → **下载作为晚 5 input**
 
@@ -202,7 +202,7 @@ torchrun --nproc_per_node=4 $CODE_DIR/build_preference.py \
 
 ```bash
 torchrun --nproc_per_node=4 $CODE_DIR/stage3_dpo.py \
-  --model_path $MODEL_7B --stage2_dir /path/to/stage2-only-adapter \
+  --model_path $MODEL_7B --stage2_dir /path/to/stage2-s1-adapter \
   --data_dir $DATA_DIR \
   --output_dir $WORK_DIR/ckpt/stage3 \
   --dpo_data dpo_pairs.jsonl \
@@ -289,7 +289,7 @@ eval/evaluate.py --model_name stage3   --OMICS all_omics --input_file_path $WORK
 | 消融 | 对比 | 必要性 |
 |---|---|---|
 | ① **Stage 1 必要性** | `stage2_s1` vs `stage2_only`（两分支均 28.98万 全量） | 完整本地消融 |
-| ② **DPO 改善对齐** | `stage3` vs `stage2_only`（同 2.5万 pairs） | **核心消融，必做** |
+| ② **DPO 改善对齐** | `stage3` vs `stage2_s1`（同 2.5万 pairs，路径 B 起于 stage2_s1） | **核心消融，必做** |
 | ③ **数据量**（可选） | 5万 vs 28.98万 Stage 2 对比 | 时间充裕时 |
 
 **指标**：`eval/evaluate.py` 沿用论文官方评估协议（input/label/task/model_output）。  

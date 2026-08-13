@@ -37,7 +37,9 @@ def pack_texts(texts, tokenizer, max_len):
     """把文本序列 token 化后拼成固定长度块（packing）。"""
     all_ids = []
     for t in texts:
-        ids = tokenizer.encode(t, add_special_tokens=False)
+        # max_length + truncation=False 抑制“超过 model_max_length 警告”——单文本可能 > max_len，
+        # 但 packing 后面会按 max_len 切块，不需要在 tokenize 阶段截断
+        ids = tokenizer.encode(t, add_special_tokens=False, max_length=max_len, truncation=False)
         all_ids.extend(ids)
     blocks = []
     for i in range(0, len(all_ids) - max_len + 1, max_len):

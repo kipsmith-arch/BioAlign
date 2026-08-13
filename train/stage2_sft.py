@@ -40,8 +40,8 @@ def encode_sft(item, tokenizer, max_len, system_prompt):
     # prompt = system + user + assistant 头（不含 assistant 内容）
     prompt_text = tokenizer.apply_chat_template(
         msgs[:-1], tokenize=False, add_generation_prompt=True)
-    ids_full = tokenizer.encode(full_text, add_special_tokens=False)
-    ids_prompt = tokenizer.encode(prompt_text, add_special_tokens=False)
+    ids_full = tokenizer.encode(full_text, add_special_tokens=False, max_length=max_len, truncation=False)
+    ids_prompt = tokenizer.encode(prompt_text, add_special_tokens=False, max_length=max_len, truncation=False)
 
     # 截断保护
     if len(ids_full) > max_len:
