@@ -42,18 +42,32 @@ def setup_env():
     for name in ("transformers.modeling_utils", "transformers.tokenization_utils_base",
                  "transformers.trainer", "peft", "peft.utils", "peft.tuners.tuners_utils"):
         logging.getLogger(name).setLevel(logging.WARNING)
-    # Monkey-patch torch.utils.checkpoint.checkpoint 自动补 use_reentrant=False：
-    # PyTorch 2.5 强制要求传 use_reentrant，否则每个 forward step 都报 deprecation 警告。
-    # transformers 内部旧代码调 checkpoint() 没传 use_reentrant——monkey-patch 根因消除（不是抑制 warnings）
+    # Monkey-patch checkpoint 自动补 use_reentrant=False：PyTorch 2.5 强制要求传 use_reentrant，
+    # 否则每次调用都报 deprecation 警告。注意两个坑（此前 patch 未生效的根因）：
+    #   1) transformers 在 import 时执行 `from torch.utils.checkpoint import checkpoint`，
+    #      手里握的是原函数对象——只改 torch 模块属性拦不住它，必须连 modeling_utils
+    #      模块里那个引用一起换。
+    #   2) 有的调用方显式传 use_reentrant=None，`if "use_reentrant" not in kwargs` 漏判，
+    #      要用 setdefault 兜住 None。
     import torch.utils.checkpoint as _ckpt_mod
     if not getattr(_ckpt_mod.checkpoint, "_patched_use_reentrant", False):
         _orig_ckpt = _ckpt_mod.checkpoint
         def _ckpt_patched(function, *args, **kwargs):
-            if "use_reentrant" not in kwargs:
-                kwargs["use_reentrant"] = False
+            kwargs.setdefault("use_reentrant", False)
             return _orig_ckpt(function, *args, **kwargs)
         _ckpt_patched._patched_use_reentrant = True
         _ckpt_mod.checkpoint = _ckpt_patched
+        import transformers.modeling_utils as _mu
+        if _mu.checkpoint is not _ckpt_patched:
+            _mu.checkpoint = _ckpt_patched
+    # TP 检查补丁：transformers 在 from_pretrained **内部**调用 verify_tp_plan
+    # （modeling_utils.py ~5025，按 logger.level >= WARNING 门控），加载完成后才清
+    # model._tp_plan 为时已晚——警告必然在加载期打出。项目用 DDP 从不 TP，这个检查
+    # 对我们无意义，把 modeling_utils 持有的 verify_tp_plan 引用换成 no-op（根因消除，非抑制日志）。
+    import transformers.modeling_utils as _mu
+    if not getattr(_mu, "_patched_verify_tp_plan", False):
+        _mu.verify_tp_plan = lambda *a, **k: None
+        _mu._patched_verify_tp_plan = True
     # Monkey-patch Trainer.tokenizer property：消除 "Trainer.tokenizer is now deprecated" 警告
     # transformers 4.52 的 @property 在每次访问 trainer.tokenizer 时都 warn——覆盖为直接返回 processing_class
     from transformers import Trainer as _HfTrainer
@@ -152,8 +166,9 @@ def load_model_tokenizer(model_path: str, use_4bit: bool = True, max_len: int = 
             model_path, torch_dtype=torch.bfloat16,
             device_map=device_map, trust_remote_code=True)
     model.config.use_cache = False
-    # 真修 TP warnings：accelerate 的 check_tp_plan 检测到模型有 TP 规则但我们用 DDP/device_map 不应用
-    # 清空模型 _tp_plan / config._tp_plan = 告诉 accelerate "我们不打算做 TP"（根因消除，非抑制日志）
+    # TP warnings 的真修在 setup_env()（把 modeling_utils.verify_tp_plan 替换为 no-op）——
+    # verify_tp_plan 是在 from_pretrained 加载期间被调用的，这里加载完才清 _tp_plan 已经晚了。
+    # 下面的清空保留作防御（后续若有其他路径读 _tp_plan 也不至于误判我们在做 TP）。
     for attr in ("_tp_plan",):
         if hasattr(model, attr):
             setattr(model, attr, None)
@@ -171,7 +186,13 @@ def enable_grad_checkpointing(model):
 
 def add_lora(model, r: int = 16, alpha: int = 32, dropout: float = 0.05, train_norm: bool = False):
     """给模型套 LoRA（QLoRA 标准做法）。train_norm=True 时同时训练 RMSNorm 层（论文 Stage 1 做法）。"""
-    model = prepare_model_for_kbit_training(model)
+    # 显式传 gradient_checkpointing_kwargs={"use_reentrant": False}：
+    # peft 的 prepare_model_for_kbit_training 默认传 {}（空 dict 而非 None），transformers 4.52 的
+    # 默认值 {"use_reentrant": True} 只在参数为 None 时生效 → 生成 bare partial(checkpoint)，
+    # 每层前向都以 use_reentrant=None 调 torch checkpoint → 每步都报 deprecation 警告。
+    # （stage1/3 加载后又显式 enable_grad_checkpointing() 才没暴露；stage2 只走这里，必须修）
+    model = prepare_model_for_kbit_training(
+        model, gradient_checkpointing_kwargs={"use_reentrant": False})
     model = get_peft_model(model, LoraConfig(
         r=r, lora_alpha=alpha, lora_dropout=dropout,
         target_modules=QWEN_TARGET_MODULES, bias="none", task_type="CAUSAL_LM"))

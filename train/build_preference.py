@@ -70,7 +70,19 @@ def main():
     if IS_MAIN:
         print(f"[Pref] 读取 {args.in_file}: {len(rows)} 条")
 
-    out_path = f"{args.output_dir}/{args.out_file}"
+    # 多卡 sharding：每个 rank 处理自己的子集，避免 4 卡各生成全部 N 对的 4× 浪费
+    # 和同一 out_file 被写 4 次（last-write-wins，rank 0 不一定最后写）。
+    # 顺序轮转切分 [rank::world]；rank 0 写主名，其他 rank 写 ".rank{i}" 后缀，循环结束后 rank 0 合并。
+    import torch.distributed as dist
+    rank, world = 0, 1
+    if dist.is_initialized():
+        rank, world = dist.get_rank(), dist.get_world_size()
+        rows = rows[rank::world]
+        if IS_MAIN:
+            print(f"[Pref] rank sharding: world={world}, 本 rank {rank} 处理 {len(rows)} 条")
+
+    rank_suffix = f".rank{rank}" if world > 1 else ""
+    out_path = f"{args.output_dir}/{args.out_file}{rank_suffix}"
     written, skipped = 0, 0
     with open(out_path, "w", encoding="utf-8") as f:
         for i, r in enumerate(rows):
@@ -111,7 +123,21 @@ def main():
                     print(f"  已处理 {i+1}/{len(rows)}，有效 {written}，跳过 {skipped}")
 
     if IS_MAIN:
-        print(f"[Pref] 完成: 写入 {written} 对 -> {out_path}（跳过 {skipped}）")
+        print(f"[Pref] rank {rank} 完成: 写入 {written} 对 -> {out_path}（跳过 {skipped}）")
+
+    # 多卡时：所有 rank 写完后，rank 0 合并各 rank 的 ".rank*" 文件到主名，清掉后缀文件
+    if world > 1:
+        from torch.distributed import barrier as _barrier
+        _barrier()
+        if rank == 0:
+            import glob, os as _os
+            final_path = f"{args.output_dir}/{args.out_file}"
+            with open(final_path, "w", encoding="utf-8") as fout:
+                for rp in sorted(glob.glob(f"{args.output_dir}/{args.out_file}.rank*")):
+                    with open(rp, encoding="utf-8") as fin:
+                        fout.write(fin.read())
+                    _os.remove(rp)
+            print(f"[Pref] merged {world} rank files -> {final_path}")
 
 
 if __name__ == "__main__":

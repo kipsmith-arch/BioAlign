@@ -205,7 +205,11 @@ def main():
     # 确保 trainer.processing_class 已设（避免 transformers 内部访问 .tokenizer 触发 deprecation）
     if trainer.processing_class is None:
         trainer.processing_class = tokenizer
-    # DPO 的 input key 是 chosen_input_ids/rejected_input_ids，告知 Trainer 让其能 estimate tokens
+    # DPO 的 input key 是 chosen_input_ids/rejected_input_ids，告知 Trainer 让其能 estimate tokens。
+    # 关键：必须设到 base model 上——PeftModel.__getattr__ 把 floating_point_ops/estimate_tokens
+    # 转发给 base_model 执行，方法体内读的是 base 的 main_input_name（默认 "input_ids"），
+    # 只改 PeftModel 包装层上的同名属性不会被读到（此前该修复未生效、警告仍在的根因）。
+    model.get_base_model().main_input_name = "chosen_input_ids"
     if hasattr(model, "main_input_name"):
         model.main_input_name = "chosen_input_ids"
     trainer.add_callback(ProgressCallback())
