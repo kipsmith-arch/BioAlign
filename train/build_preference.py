@@ -83,6 +83,25 @@ def main():
 
     rank_suffix = f".rank{rank}" if world > 1 else ""
     out_path = f"{args.output_dir}/{args.out_file}{rank_suffix}"
+
+    # 清理上一轮残留的 .rank* 文件，防止 merge 读到过期内容
+    # （import 移到这里只在多卡路径需要，避免在只读代码路径开销）
+    if world > 1:
+        import glob as _glob_cleanup
+        import os as _os_cleanup
+        # 所有 rank 先各自清自己的 .rank{rank}（以防上次以同样 rank 写了一半）
+        my_old = f"{args.output_dir}/{args.out_file}.rank{rank}"
+        if _os_cleanup.path.exists(my_old):
+            _os_cleanup.remove(my_old)
+            if IS_MAIN:
+                print(f"[Pref] rank {rank} 清理残留 {my_old}")
+        # rank 0 额外清任何其他 .rank* 残留（防止上轮不同 world 没清干净）
+        if rank == 0:
+            for old in _glob_cleanup.glob(f"{args.output_dir}/{args.out_file}.rank*"):
+                if old != my_old:
+                    _os_cleanup.remove(old)
+                    print(f"[Pref] rank 0 清理其他残留 {old}")
+
     written, skipped = 0, 0
     with open(out_path, "w", encoding="utf-8") as f:
         for i, r in enumerate(rows):
@@ -144,12 +163,38 @@ def main():
         if rank == 0:
             import glob, os as _os
             final_path = f"{args.output_dir}/{args.out_file}"
-            with open(final_path, "w", encoding="utf-8") as fout:
-                for rp in sorted(glob.glob(f"{args.output_dir}/{args.out_file}.rank*")):
+            tmp_path = final_path + ".tmp"
+            rank_files = sorted(glob.glob(f"{args.output_dir}/{args.out_file}.rank*"))
+            # 防御：world=4 应该正好 4 个文件
+            if len(rank_files) != world:
+                print(f"[Pref] 警告：期望 {world} 个 .rank* 文件，实际 {len(rank_files)} 个：{rank_files}")
+            # 原子写：先写 .tmp 临时文件，fsync 后原子 rename 到主名
+            # （避免 merge 中途崩溃产出部分合并的 dpo_pairs.jsonl）
+            with open(tmp_path, "w", encoding="utf-8") as fout:
+                total_lines = 0
+                for rp in rank_files:
                     with open(rp, encoding="utf-8") as fin:
-                        fout.write(fin.read())
+                        chunk = fin.read()
+                        fout.write(chunk)
+                        total_lines += chunk.count("\n")
                     _os.remove(rp)
-            print(f"[Pref] merged {world} rank files -> {final_path}")
+                fout.flush()
+                _os.fsync(fout.fileno())
+            _os.replace(tmp_path, final_path)  # 原子 rename
+            # 验证：合并后文件每行应能被 json.loads 解析
+            ok = bad = 0
+            with open(final_path, encoding="utf-8") as f:
+                for line in f:
+                    line = line.strip()
+                    if not line: continue
+                    try:
+                        import json as _json
+                        _json.loads(line); ok += 1
+                    except Exception:
+                        bad += 1
+            print(f"[Pref] merged {world} rank files -> {final_path}（valid={ok}, invalid={bad}, lines={total_lines}）")
+            if bad > 0:
+                raise RuntimeError(f"[Pref] merge 后 dpo_pairs.jsonl 有 {bad} 条损坏 JSON——可能上次 race 残留未被清理干净，请检查 .rank* 文件是否已被其他进程占用")
 
 
 if __name__ == "__main__":
