@@ -122,6 +122,18 @@ def main():
                 if IS_MAIN:
                     print(f"  已处理 {i+1}/{len(rows)}，有效 {written}，跳过 {skipped}")
 
+        # fsync 强制落盘：f.close()（with 退出）只 flush Python buffer → OS page cache
+        # os.fsync() 才走 OS → 物理磁盘；保证随后 barrier 后 rank 0 能读到完整文件
+        # （避免 OS page cache / NFS 延迟造成读不到——屏障同步的是状态，不是磁盘落定）
+        try:
+            f.flush()
+            os.fsync(f.fileno())
+        except (AttributeError, OSError) as _e:
+            # 某些 FS（NFS 等）不支持 fsync 或 fd 已失效，警告但不中断
+            # —— 即使 fsync 失败，下面 barrier 仍保证跨 rank 同步
+            if IS_MAIN:
+                print(f"[Pref] rank {rank} fsync 失败（跳过 fsync，但 barrier 仍在此后）: {_e}")
+
     if IS_MAIN:
         print(f"[Pref] rank {rank} 完成: 写入 {written} 对 -> {out_path}（跳过 {skipped}）")
 

@@ -231,6 +231,100 @@ LLaMA-70B 训练 2048 张 A100 = 16×16 组合
 
 **面试可讲**：为什么"按张量切"而不是"按层切"——单卡装不下整个模型（优化器状态就超），但单层装得下，所以切单层权重到多卡并行算 → 设备利用率 1、无气泡、通信可重叠，代价是每层要写并行版本 + 需高速互联。大模型必须 TP×PP 组合，本项目 3B/7B 单卡够 + Kaggle 无 NVLink → 选 DDP。
 
+### 2.12 多卡写文件的同步：fsync + barrier（build_preference 踩坑总结）
+
+**问题场景**：多个 rank 各自生成拒绝样本（rejected），最后需要合并成一个 `dpo_pairs.jsonl`。如果 4 rank 写**同一个**文件会 race（多次 truncate / append 交叉），出“断尾 JSON”【上次实战：line 51 是 `ion."}]}` 残片】。
+
+**结构性解法**：每个 rank 写**独立**的 `.rank{i}` 文件 → barrier 同步 → rank 0 合并。以及一个被忽略的重要细节：**手动 fsync 强制落盘**。
+
+#### 2.12.1 三层 flush 语义
+
+```
+Python	buffer（随个函数调用）          ❌ 不能跨进程
+↓  f.close() / f.flush()
+OS	page cache（跨进程可见）             ✅ 同主机其他进程可读
+↓  os.fsync()
+disk	物理磁盘（跨主机可见）            ✅ NFS / 共享存储跨主机可读
+```
+
+**坑**：只用 `f.close()`（with 块退出）只保证到 page cache。**rank 0 读其他 rank 的 `.rank{i}` 是同主机、可见的**，不会碰到这个坑。但为防 NFS / 异常路径，加 `os.fsync(f.fileno())` 才是万无一失。
+
+#### 2.12.2 barrier 的语义（不要你以为）
+
+`torch.distributed.barrier()` 是 **collective** 操作（distributed_c10d.py:4123 原文档）：
+
+> Synchronize all processes. This collective blocks processes until the whole group enters this function.
+
+不依赖“rank 0 最后退出”的约定，是数学保证：
+
+```
+T0:  rank 0 写完 → 调 barrier()，阻塞
+T1:  rank 1 写完 → 调 barrier()，阻塞
+T2:  rank 2 写完 → 调 barrier()，阻塞
+T3:  rank 3 写完 → 调 barrier()
+                  ↓ 全部到齐
+T4:  4 个 rank 同时从 barrier 返回
+T5:  rank 0 进入 if rank == 0: 读 .rank* 合并
+```
+
+**不变量**：T5 时所有 rank 已在 T0-T3 退出 `with` 块（文件 flush 到 page cache），且 fsync 过。
+
+#### 2.12.3 完整同步代码（build_preference.py 实际使用）
+
+```python
+import os as _os
+with open(out_path, "w", encoding="utf-8") as f:
+    for r in rows:
+        f.write(json.dumps(...) + "\n")
+    # 在 with 块内、close 之前手动 fsync
+    f.flush()
+    _os.fsync(f.fileno())
+
+if world > 1:
+    from torch.distributed import barrier as _barrier
+    _barrier()
+    if rank == 0:
+        # 合并
+        files = sorted(glob.glob(f"{args.output_dir}/{args.out_file}.rank*"))
+        with open(final_path, "w") as fout:
+            for fp in files:
+                with open(fp) as fin:
+                    fout.write(fin.read())
+                _os.remove(fp)
+```
+
+**关键点**：
+- **fsync 在 with 块内**（fd 仍有效）。退出 with 后 fd 失效，`os.fsync(closed_fd)` 报 `ValueError`。
+- **barrier在所有 rank 写完后**。任何 rank 没调 barrier，其他 rank 全部陪阻塞。
+- **合并只由 rank 0 做**。其他 rank 过 barrier 后仅继续到 `dist.destroy_process_group()`。
+
+#### 2.12.4 性能开销
+
+- **本地 FS（ext4/xfs/NTFS）**：fsync 1-2ms。4 rank 反正要 barrier 同步，额外开销可忽略。
+- **NFS / 共享存储**：fsync 10-100ms。本项目用 Kaggle 本地磁盘 / 自托管 NVMe、本地 FS，fsync 开销可忽略。
+
+#### 2.12.5 错误处理
+
+```python
+try:
+    f.flush()
+    os.fsync(f.fileno())
+except (AttributeError, OSError) as _e:
+    if IS_MAIN:
+        print(f"[Pref] rank {rank} fsync 失败: {_e}")
+    # 继续—— barrier 仍能保证同步，只是容错
+```
+
+某些 FS（NFS v3 mode、某些容器）不支持 fsync。败了不中断，barrier 仍能保证同一主机其他 rank 读到完整文件（page cache 层）。
+
+#### 2.12.6 为什么不用更高级的方案
+
+- **gRPC/PyTorch distributed metadata**：可以在 barrier 同步 metadata（“rank i 写完了”），但代码复杂度高、依赖多。上面方案足够。
+- **in-memory gather**（`dist.gather_object`）：仅适合小数据，build_preference 输出可达 GB 级，不适合内存 gather。
+- **Redis / S3 协调**：额外依赖，部署复杂。
+
+【面试可讲】多进程写文件三步同步：`f.close()`（同主机可见）→ `os.fsync()`（跨主机可见）→ `barrier()`（跨进程同步）。**`barrier` 同步的是进程状态，不是磁盘落定**——要保证 rank 0 读到完整文件，必须额外 fsync。
+
 ---
 
 ## 3. DPO 与 gradient checkpointing 原理（Stage 3 必备知识）

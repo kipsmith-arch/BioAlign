@@ -252,13 +252,12 @@ def read_jsonl(path: str, max_samples: int = -1):
             try:
                 out.append(json.loads(line))
             except json.JSONDecodeError as e:
-                # 给出文件路径 + 前 200 字节内容，定位是损坏还是空行
-                with open(path, "rb") as fb:
-                    head_bytes = fb.read(200)
+                # 报告出错行的实际字节（不是文件头）—— 上次 race 误导排查了一轮
+                line_bytes = line.encode("utf-8")[:200]
                 raise ValueError(
                     f"read_jsonl: JSON 解析失败 → {path}\n"
                     f"  错误行 {line_num}: {e}\n"
-                    f"  文件前 200 字节: {head_bytes!r}\n"
+                    f"  出错行前 200 字节: {line_bytes!r}\n"
                     f"  文件总大小: {size} 字节"
                 )
             if max_samples > 0 and len(out) >= max_samples:
