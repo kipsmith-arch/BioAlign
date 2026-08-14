@@ -81,26 +81,25 @@ def main():
         if IS_MAIN:
             print(f"[Pref] rank sharding: world={world}, 本 rank {rank} 处理 {len(rows)} 条")
 
-    rank_suffix = f".rank{rank}" if world > 1 else ""
+    # 统一走 .rank{rank} 后缀：单卡 world=1 也写 .rank0（下面 atomic publish 逻辑统一处理）
+    rank_suffix = f".rank{rank}"
     out_path = f"{args.output_dir}/{args.out_file}{rank_suffix}"
 
     # 清理上一轮残留的 .rank* 文件，防止 merge 读到过期内容
-    # （import 移到这里只在多卡路径需要，避免在只读代码路径开销）
-    if world > 1:
-        import glob as _glob_cleanup
-        import os as _os_cleanup
-        # 所有 rank 先各自清自己的 .rank{rank}（以防上次以同样 rank 写了一半）
-        my_old = f"{args.output_dir}/{args.out_file}.rank{rank}"
-        if _os_cleanup.path.exists(my_old):
-            _os_cleanup.remove(my_old)
-            if IS_MAIN:
-                print(f"[Pref] rank {rank} 清理残留 {my_old}")
-        # rank 0 额外清任何其他 .rank* 残留（防止上轮不同 world 没清干净）
-        if rank == 0:
-            for old in _glob_cleanup.glob(f"{args.output_dir}/{args.out_file}.rank*"):
-                if old != my_old:
-                    _os_cleanup.remove(old)
-                    print(f"[Pref] rank 0 清理其他残留 {old}")
+    import glob as _glob_cleanup
+    import os as _os_cleanup
+    # 所有 rank 先各自清自己的 .rank{rank}（以防上次以同样 rank 写了一半）
+    my_old = f"{args.output_dir}/{args.out_file}.rank{rank}"
+    if _os_cleanup.path.exists(my_old):
+        _os_cleanup.remove(my_old)
+        if IS_MAIN:
+            print(f"[Pref] rank {rank} 清理残留 {my_old}")
+    # rank 0 额外清任何其他 .rank* 残留（防止上轮不同 world 没清干净）
+    if rank == 0:
+        for old in _glob_cleanup.glob(f"{args.output_dir}/{args.out_file}.rank*"):
+            if old != my_old:
+                _os_cleanup.remove(old)
+                print(f"[Pref] rank 0 清理其他残留 {old}")
 
     written, skipped = 0, 0
     with open(out_path, "w", encoding="utf-8") as f:
@@ -156,45 +155,51 @@ def main():
     if IS_MAIN:
         print(f"[Pref] rank {rank} 完成: 写入 {written} 对 -> {out_path}（跳过 {skipped}）")
 
-    # 多卡时：所有 rank 写完后，rank 0 合并各 rank 的 ".rank*" 文件到主名，清掉后缀文件
+    # 不论单卡/多卡，都走原子 publishes 流程：写 .tmp → fsync → os.replace() → 验证
+    # ——多卡这里是 merge .rank*（多卡内 barrier 保证齐），单卡是 move .rank0 到主名
+    import glob as _glob_final
+    import os as _os_final
+    import json as _json_final
+
     if world > 1:
         from torch.distributed import barrier as _barrier
         _barrier()
-        if rank == 0:
-            import glob, os as _os
-            final_path = f"{args.output_dir}/{args.out_file}"
-            tmp_path = final_path + ".tmp"
-            rank_files = sorted(glob.glob(f"{args.output_dir}/{args.out_file}.rank*"))
-            # 防御：world=4 应该正好 4 个文件
-            if len(rank_files) != world:
-                print(f"[Pref] 警告：期望 {world} 个 .rank* 文件，实际 {len(rank_files)} 个：{rank_files}")
-            # 原子写：先写 .tmp 临时文件，fsync 后原子 rename 到主名
-            # （避免 merge 中途崩溃产出部分合并的 dpo_pairs.jsonl）
-            with open(tmp_path, "w", encoding="utf-8") as fout:
-                total_lines = 0
-                for rp in rank_files:
-                    with open(rp, encoding="utf-8") as fin:
-                        chunk = fin.read()
-                        fout.write(chunk)
-                        total_lines += chunk.count("\n")
-                    _os.remove(rp)
-                fout.flush()
-                _os.fsync(fout.fileno())
-            _os.replace(tmp_path, final_path)  # 原子 rename
-            # 验证：合并后文件每行应能被 json.loads 解析
-            ok = bad = 0
-            with open(final_path, encoding="utf-8") as f:
-                for line in f:
-                    line = line.strip()
-                    if not line: continue
-                    try:
-                        import json as _json
-                        _json.loads(line); ok += 1
-                    except Exception:
-                        bad += 1
-            print(f"[Pref] merged {world} rank files -> {final_path}（valid={ok}, invalid={bad}, lines={total_lines}）")
-            if bad > 0:
-                raise RuntimeError(f"[Pref] merge 后 dpo_pairs.jsonl 有 {bad} 条损坏 JSON——可能上次 race 残留未被清理干净，请检查 .rank* 文件是否已被其他进程占用")
+
+    if rank == 0:
+        final_path = f"{args.output_dir}/{args.out_file}"
+        tmp_path = final_path + ".tmp"
+        # 多卡：merge .rank*；单卡：rank 0 就是 .rank0
+        rank_files = sorted(_glob_final.glob(f"{args.output_dir}/{args.out_file}.rank*"))
+        if len(rank_files) != world:
+            print(f"[Pref] 警告：期望 {world} 个 .rank* 文件，实际 {len(rank_files)} 个：{rank_files}")
+        if not rank_files:
+            raise RuntimeError(f"[Pref] 未找到 .rank* 文件（{args.output_dir}/{args.out_file}.rank*），请检查 build_preference 是否成功写入")
+        # 原子写：先写 .tmp 临时文件，fsync 后原子 rename 到主名
+        # （不论单卡还是多卡，都走这步——避免任何场景下产出半合并文件）
+        with open(tmp_path, "w", encoding="utf-8") as fout:
+            total_lines = 0
+            for rp in rank_files:
+                with open(rp, encoding="utf-8") as fin:
+                    chunk = fin.read()
+                    fout.write(chunk)
+                    total_lines += chunk.count("\n")
+                _os_final.remove(rp)
+            fout.flush()
+            _os_final.fsync(fout.fileno())
+        _os_final.replace(tmp_path, final_path)  # atomic rename
+        # 验证：合并后文件每行应能被 json.loads 解析
+        ok = bad = 0
+        with open(final_path, encoding="utf-8") as f:
+            for line in f:
+                line = line.strip()
+                if not line: continue
+                try:
+                    _json_final.loads(line); ok += 1
+                except Exception:
+                    bad += 1
+        print(f"[Pref] {'merged' if world > 1 else 'published'} {world} rank file(s) -> {final_path}（valid={ok}, invalid={bad}, lines={total_lines}）")
+        if bad > 0:
+            raise RuntimeError(f"[Pref] {'merge' if world > 1 else 'publish'} 后 dpo_pairs.jsonl 有 {bad} 条损坏 JSON——可能上次 race 残留未被清理干净，请检查 .rank* 文件是否已被其他进程占用")
 
 
 if __name__ == "__main__":

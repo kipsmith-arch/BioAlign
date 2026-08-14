@@ -21,12 +21,14 @@ import sys
 import os
 
 from datasets import Dataset
-from peft import PeftModel
+from peft import PeftModel, prepare_model_for_kbit_training
 from transformers import DataCollatorForSeq2Seq, Trainer, TrainingArguments
 
 sys.path.insert(0, __file__.rsplit("/", 1)[0])
 from common import (ProgressCallback, SYSTEM_PROMPT, add_common_args, add_lora,
-                    load_model_tokenizer, read_jsonl, setup_env, setup_output_dir)
+                    build_lora_plus_optimizer, enable_grad_checkpointing,
+                    load_model_tokenizer, read_jsonl, setup_env,
+                    setup_output_dir)
 
 
 def encode_sft(item, tokenizer, max_len, system_prompt):
@@ -72,7 +74,16 @@ def main():
     if args.resume_adapter:
         if IS_MAIN:
             print(f"[Stage2] 从 Stage1 adapter 继续: {args.resume_adapter}")
+        # 【修复 OOM】resume 路径必须复用 QLoRA 标配：
+        #   1) prepare_model_for_kbit_training → enable_input_require_grads + cast LayerNorm
+        #      不开这个，配合 gradient checkpoint 时 LoRA→base 的梯度链断裂，前向要么失败
+        #      要么 PyTorch 强制保留整图，导致 base 7B 的激活占满显存。
+        #   2) gradient_checkpointing_enable(use_reentrant=False) → 用时间换显存，
+        #      把激活从 O(L·H) 降到 O(sqrt(L·H))，4bit 7B + 1024 序列的关键。
         model = PeftModel.from_pretrained(model, args.resume_adapter)
+        model = prepare_model_for_kbit_training(
+            model, gradient_checkpointing_kwargs={"use_reentrant": False})
+        enable_grad_checkpointing(model)
         for n, p in model.named_parameters():
             if "lora" in n:
                 p.requires_grad_(True)
@@ -109,9 +120,13 @@ def main():
         report_to=[],
         ddp_find_unused_parameters=False,
     )
+    # 【省显存】用 bitsandbytes 8bit AdamW，fp32 优化器状态 → 1B/参数，8B model 的 LoRA
+    # 训练省 ~5GiB 优化器状态显存；不影响收敛。
+    optimizer = build_lora_plus_optimizer(model, base_lr=args.lr)
     trainer = Trainer(model=model, args=train_args, train_dataset=dataset,
                       data_collator=DataCollatorForSeq2Seq(
-                          tokenizer, padding=True, label_pad_token_id=-100))
+                          tokenizer, padding=True, label_pad_token_id=-100),
+                      optimizers=(optimizer, None))
     trainer.add_callback(ProgressCallback())
     if IS_MAIN:
         print("[Stage2] 开始训练 ...")
