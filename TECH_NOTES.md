@@ -18,6 +18,7 @@
 | 优化器状态（8bit AdamW） | 可训练参数 × ~1B/参数 | ✅ bnb 量化后 |
 | **激活（激活函数中间量）** | **无简洁公式** | ⚠️ **纯经验量级，以实测为准** |
 | **loss logits 峰值** | **batch × seq × vocab × 4B（fp32 计算 CE）** | ⚠️ **易被忽略的峰值源**（实测：batch4×1024×151936×4B≈2.49GB） |
+| **stage3 DPO logits_fp32 补充** | chosen+rejected 各一张 + bf16/fp32 mix → **堆积 4× logit 峰值** | ⚠️ DPO 特有。代码 `stage3_dpo.py::token_logprobs` 已重构：logits 默认 dtype 为主下 log_softmax + 立刻 gather 到 (B, T-1)，跳避 (B, T, V) 全张 fp32 峰值 |
 
 **关键原则：权重/优化器可精确预算；激活只能给量级；还要注意 loss 计算在 vocab 维度上的 logits 峰值张量**——最终以显存监控 / OOM 报错反推为准。
 
@@ -74,13 +75,20 @@ A: r × d_in，B: d_out × r   → 新增参数 = r × (d_in + d_out)
 - max_len 2048→1024、batch 4→2：激活 ∝ batch×seq，约降到 1/4（线性关系）
 - grad checkpoint：激活再降一个量级
 
-### 1.6 本项目 Stage 1 的显存预算结论（T4 单卡 14.56GB 实测）
+### 1.6 本项目后期阶段显存预算（实测 A100 40GB×4 / 7B 4bit）
 
 ```
-4bit QLoRA：权重 ~2GB + 激活/优化器 → 峰值 ~5-6GB → 单卡可跑 ✅（Stage 1 定稿）
-bf16 3B：单卡加载后 11.95GB、训练峰值 13GB+ → 单卡/DDP 双卡均装不下 ❌
-（DDP 每卡完整副本、固定开销不摊薄——bf16 双卡同样 ~13.5GB/卡，仍超限）
+Stage 1：peak ≈ 19.0GiB/卡（bf16 LoRA+，8bit AdamW，2048 序列）
+Stage 2 SFT：peak ≈ 17.9GiB/卡（4bit QLoRA，code 默认 1024 序列）
+Stage 3 DPO：peak ≈ 26.8GiB/卡（4bit QLoRA + ref 同副本，1024 序列，chosen+rejected）
 ```
+
+Stage 2 烟测代码刚修改后（DDP×4 / 4bit / batch=2 / 1024 序列），peak 实测 17.9GiB/卡，
+free=30.6GiB。Stage 3 DPO 代码 logits .float() 优化 后，peak 实测 26.8GiB/卡，
+free=26.0GiB。**全都在 A100 40GB 预算内，可放心上全量**。
+
+**实测来源**：以上数字均从烟测输出（`[进度] step ... peak=X.XG`）取证。所有数字都会随语料、
+batch、max_len 变动，仅作设计参考——重新启动新训练时仍需以当次烟测的 peak 为准。
 
 ---
 
@@ -231,13 +239,59 @@ LLaMA-70B 训练 2048 张 A100 = 16×16 组合
 
 **面试可讲**：为什么"按张量切"而不是"按层切"——单卡装不下整个模型（优化器状态就超），但单层装得下，所以切单层权重到多卡并行算 → 设备利用率 1、无气泡、通信可重叠，代价是每层要写并行版本 + 需高速互联。大模型必须 TP×PP 组合，本项目 3B/7B 单卡够 + Kaggle 无 NVLink → 选 DDP。
 
-### 2.12 多卡写文件的同步：fsync + barrier（build_preference 踩坑总结）
+### 2.12 build_preference：代码兼容多卡，**运行时强制单卡**
 
-**问题场景**：多个 rank 各自生成拒绝样本（rejected），最后需要合并成一个 `dpo_pairs.jsonl`。如果 4 rank 写**同一个**文件会 race（多次 truncate / append 交叉），出“断尾 JSON”【上次实战：line 51 是 `ion."}]}` 残片】。
+#### 2.12.1 事实状态
 
-**结构性解法**：每个 rank 写**独立**的 `.rank{i}` 文件 → barrier 同步 → rank 0 合并。以及一个被忽略的重要细节：**手动 fsync 强制落盘**。
+`build_preference.py` 里有完整的 DDP 同步逻辑（sharding + `.rank{i}` + barrier + rank 0 合并），
+但入口处加了 hard assert：**`WORLD_SIZE > 1` 直接 RuntimeError**。
 
-#### 2.12.1 三层 flush 语义
+```python
+if "WORLD_SIZE" in os.environ and int(os.environ.get("WORLD_SIZE", "1")) > 1:
+    raise RuntimeError(
+        "[Pref] build_preference 不支持 torchrun 多卡（生成式脚本，不需 DDP）。"
+        "请用 `python train/build_preference.py ...` 直接跑。"
+    )
+```
+
+但 sharding 代码块仍保留。以备未来使用 vLLM / 多机推理场景复用，**本身不依赖 torchrun 多卡**。
+
+#### 2.12.2 为什么强制单卡（踩坑历史）
+
+某次 4 卡 DDP 启动下，错误仅能看到 `[Pref] 未找到 .rank* 文件` —— 误导使用者以为“写入失败”。
+根因：4 个 rank 同时加载 7B 4bit base + adapter（×2：policy + ref）实例，总显存顶到 OOM？**3-4
+卡退出** —— elastic launcher 默认 60s 超时后 **SIGTERM** 主进程，rank 0 还未写到文件就死了。
+
+**两件本质错误**：
+1. **生成式推理不需要 DDP**：`model.generate()` 不反传、不跨进程梯度同步。4 卡运行只是 “4 份完整
+   模型并行生成同一批样本”，既不快、还造成 4× 显存。
+2. **代码 .rank* sharding 是为错误场景设计的**：原为多卡加速准备，但 7B 4bit 在 40GB A100 上多
+   卡并不会快，反而是 OOM 设计。
+
+**正确范式**：
+- 生成式任务：单卡 sequential 或 vLLM batched inference。
+- 训练任务（需反向、同步梯度）才用 DDP。
+
+#### 2.12.3 单卡运行命令
+
+```bash
+python train/build_preference.py \
+  --model_path $MODEL_7B --stage2_dir $STAGE2_ADAPTER \
+  --data_dir $DATA_DIR --output_dir $OUT_DIR \
+  --max_pairs 50 --max_samples 50 \
+  --max_new_tokens 96 --temperature 0.9 --use_4bit
+```
+
+烟测 50 对 ~5min；全量 2.5万对 预估 7-9h。
+
+#### 2.12.4 保留 sharding 代码的价值
+
+- **设计一致性**：本项目三个 stage 都用一套 DDP 架构、多进程同步；build_preference 选单卡，但
+  代码内部保留虚拟同步逻辑，风格统一。
+- **未来场景重用**：如果后续换成 vLLM 多进程推理，`.rank*` + barrier + 原子 rename 仍可直接复用，
+  只需修改 `main()` 启动部分。
+
+#### 2.12.5 三层 flush 语义（补充，面向将来 vLLM 场景）
 
 ```
 Python	buffer（随个函数调用）          ❌ 不能跨进程
@@ -247,83 +301,19 @@ OS	page cache（跨进程可见）             ✅ 同主机其他进程可读
 disk	物理磁盘（跨主机可见）            ✅ NFS / 共享存储跨主机可读
 ```
 
-**坑**：只用 `f.close()`（with 块退出）只保证到 page cache。**rank 0 读其他 rank 的 `.rank{i}` 是同主机、可见的**，不会碰到这个坑。但为防 NFS / 异常路径，加 `os.fsync(f.fileno())` 才是万无一失。
+**为什么现在不需要 fsync**：同主机内存可见 → page cache 同步足够。**为防 NFS/跨主机 / 异常路径，加
+`os.fsync(f.fileno())` 才是万无一失**——代码里已加（try/except 包住，败了不中断、barrier 仍同步）。
 
-#### 2.12.2 barrier 的语义（不要你以为）
+#### 2.12.6 面试可讲
 
-`torch.distributed.barrier()` 是 **collective** 操作（distributed_c10d.py:4123 原文档）：
+**生成式与训练式脚本的区别**：
+- 训练：`loss.backward()` + `optimizer.step()` → DDP 反向同步 → 多卡有价值（倍加速比）。
+- 生成：`model.generate()` → 不反传 → 多卡理论上可但需合理设计（vLLM 连续批 / tensor parallel），
+  而 DDP 启动只会造成 4× 显存、无加速。
 
-> Synchronize all processes. This collective blocks processes until the whole group enters this function.
-
-不依赖“rank 0 最后退出”的约定，是数学保证：
-
-```
-T0:  rank 0 写完 → 调 barrier()，阻塞
-T1:  rank 1 写完 → 调 barrier()，阻塞
-T2:  rank 2 写完 → 调 barrier()，阻塞
-T3:  rank 3 写完 → 调 barrier()
-                  ↓ 全部到齐
-T4:  4 个 rank 同时从 barrier 返回
-T5:  rank 0 进入 if rank == 0: 读 .rank* 合并
-```
-
-**不变量**：T5 时所有 rank 已在 T0-T3 退出 `with` 块（文件 flush 到 page cache），且 fsync 过。
-
-#### 2.12.3 完整同步代码（build_preference.py 实际使用）
-
-```python
-import os as _os
-with open(out_path, "w", encoding="utf-8") as f:
-    for r in rows:
-        f.write(json.dumps(...) + "\n")
-    # 在 with 块内、close 之前手动 fsync
-    f.flush()
-    _os.fsync(f.fileno())
-
-if world > 1:
-    from torch.distributed import barrier as _barrier
-    _barrier()
-    if rank == 0:
-        # 合并
-        files = sorted(glob.glob(f"{args.output_dir}/{args.out_file}.rank*"))
-        with open(final_path, "w") as fout:
-            for fp in files:
-                with open(fp) as fin:
-                    fout.write(fin.read())
-                _os.remove(fp)
-```
-
-**关键点**：
-- **fsync 在 with 块内**（fd 仍有效）。退出 with 后 fd 失效，`os.fsync(closed_fd)` 报 `ValueError`。
-- **barrier在所有 rank 写完后**。任何 rank 没调 barrier，其他 rank 全部陪阻塞。
-- **合并只由 rank 0 做**。其他 rank 过 barrier 后仅继续到 `dist.destroy_process_group()`。
-
-#### 2.12.4 性能开销
-
-- **本地 FS（ext4/xfs/NTFS）**：fsync 1-2ms。4 rank 反正要 barrier 同步，额外开销可忽略。
-- **NFS / 共享存储**：fsync 10-100ms。本项目用 Kaggle 本地磁盘 / 自托管 NVMe、本地 FS，fsync 开销可忽略。
-
-#### 2.12.5 错误处理
-
-```python
-try:
-    f.flush()
-    os.fsync(f.fileno())
-except (AttributeError, OSError) as _e:
-    if IS_MAIN:
-        print(f"[Pref] rank {rank} fsync 失败: {_e}")
-    # 继续—— barrier 仍能保证同步，只是容错
-```
-
-某些 FS（NFS v3 mode、某些容器）不支持 fsync。败了不中断，barrier 仍能保证同一主机其他 rank 读到完整文件（page cache 层）。
-
-#### 2.12.6 为什么不用更高级的方案
-
-- **gRPC/PyTorch distributed metadata**：可以在 barrier 同步 metadata（“rank i 写完了”），但代码复杂度高、依赖多。上面方案足够。
-- **in-memory gather**（`dist.gather_object`）：仅适合小数据，build_preference 输出可达 GB 级，不适合内存 gather。
-- **Redis / S3 协调**：额外依赖，部署复杂。
-
-【面试可讲】多进程写文件三步同步：`f.close()`（同主机可见）→ `os.fsync()`（跨主机可见）→ `barrier()`（跨进程同步）。**`barrier` 同步的是进程状态，不是磁盘落定**——要保证 rank 0 读到完整文件，必须额外 fsync。
+**踩坑点**：“误用 DDP 启动生成脚本”不仅是浪费，还会造成 OOM → SIGTERM → 误导性错误。代码入口加
+hard assert 的价值在于：错误出现时使用者能立刻定位“误用了 torchrun”，而不是被 “未找到 .rank* 文件”
+误导去查 sharding 代码。
 
 ---
 
@@ -386,9 +376,14 @@ checkpoint:  layer1→[act1]→丢,layer2→[act2]→丢,...→layerN→[actN]  
 - 普通 SFT：1 序列前向，激活 ×1
 - DPO：chosen + rejected 两个序列 × 2 模型 = **激活 ×4**
 - 不开 checkpoint：7B 4bit 1024 DPO 双模型激活 = 单 SFT 的 4 倍，~27-30GB/卡 → OOM
-- 开 checkpoint：激活降一个量级 → ~18-22GB/卡 ✓
+- 开 checkpoint（model + ref 都调 `enable_grad_checkpointing`）：激活降一个量级 → **实测 peak ≈26.8GiB/卡** ✓
 
-`model.gradient_checkpointing_enable()`（Trainer 模型通用 API，DPO 需对 `model` 和 `ref_model` 都调一次）就是告诉模型"前向不全存激活、反向重算"。
+**为什么 DPO 还需多一步 logits 优化**：除了“激活线性减倍”，logits在 loss 计算中会临时升为 fp32
+（`(B, T, V)` ≈ 1.5GiB × 2 序列 = ≈3GiB·fp32 中间表 × 2 模型 = **8GiB** 峰值）。
+`log_softmax(bf16_logits)` 原生支持 bf16 → 立刻 gather 到 (B, T-1) fp32 token_logp → 避开该峰值。
+**这是 stage3 已应用的优化，面试时可重点讲**。“优化不是加项减项，是避开隐性峰。”
+
+`model.gradient_checkpointing_enable()`（Trainer 模型通用 API，DPO 需对 `model` 和 `ref_model` 都调一次）就是告诉模型“前向不全存激活、反向重算”。
 
 ### 3.3 面试可讲的一句话
 

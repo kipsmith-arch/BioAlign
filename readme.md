@@ -1,6 +1,9 @@
 # BioAlign —— 基于 QLoRA 与 DPO 的生物医学大模型后训练流水线
 
-在资源受限环境（单卡 T4，16GB）下，以 **Qwen2.5-3B** 为基座，完整实现大模型后训练（Post-training）三阶段流水线，使通用模型获得多组学（DNA/RNA/蛋白/多分子）生物序列的理解与任务回答能力，并通过偏好对齐提升回答质量。
+在 **A100 40GB ×4** 上以 **Qwen2.5-7B-Instruct** 为基座，完整实现大模型后训练（Post-training）三阶段流水线，使通用模型获得多组学（DNA/RNA/蛋白/多分子）生物序列的理解与任务回答能力，并通过偏好对齐提升回答质量。
+
+> 项目早期是 T4 16GB × 3B 设计方案，现已迁移到 A100×4/7B。T4 16GB × 3B 上能跑通三阶段作为指标。
+> 迁移原因：7B 模型在生物领域后训练上具有明显质量优势、A100 40GB×4 为 4-bit QLoRA 提供足够预算（peak≈26.8GiB/卡）。详见 [`REPRODUCTION_PLAN.md`](REPRODUCTION_PLAN.md)。
 
 ## 技术栈
 
@@ -35,3 +38,9 @@
 - 原始数据：`dataset/`（论文数据）、`seq/`（序列三源）—— 不入库
 - 处理产物：`data_prep/output/` —— 不入库（可脚本重生成）
 - 训练代码：`train/*.py`；评估：`eval/`；数据脚本：`data_prep/scripts/`
+
+## 运行时注意事项（重点）
+
+- **`build_preference.py` 强制单卡**：生成式推理脚本多卡会 OOM。代码中有 hard assert（`WORLD_SIZE>1` 直接 RuntimeError），启动信息清晰。必须用 `python` 而不是 `torchrun` 启动。详见 [`REPRODUCTION_PLAN.md` §8.1](REPRODUCTION_PLAN.md) 与 [`TECH_NOTES.md` §2.12](TECH_NOTES.md)
+- **显存指标看 `peak=` 不是 `alloc=`**：`common.py` 的 `ProgressCallback` 同时打 `alloc/reserved/peak/free` 四个值，判 OOM 必须看 `peak`（反向时才出现的真实峰值）
+- **DPO 显存吃紧是 `.float()` logits**：1.5GB/张的 (B·T·V) fp32 中间表 是隐性 OOM 源；`stage3_dpo.py` `token_logprobs` 已重构、保留 bf16 log_softmax 后立即 gather，避免该峰值

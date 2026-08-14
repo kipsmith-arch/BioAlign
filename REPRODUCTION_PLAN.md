@@ -50,7 +50,7 @@ train_pool_clean 净化：去重 + 模板均衡采样（每模板 cap，Top5 模
 | 1 | Stage 1 继续预训练 | 23.6万（全量） | 4-5h | ckpt/stage1 |
 | 2 | Stage 2 分支 A (stage2-only) | 28.98万（全量） | 5-6h | ckpt/stage2_only |
 | 3 | Stage 2 分支 B (stage1+stage2) | 28.98万（全量） | 5-6h | ckpt/stage2_s1 |
-| 4 | build_preference（**用 stage2_s1**） | 2.5万对（dpo_source 抽样） | 4-5h | dpo_pairs.jsonl |
+| 4 | build_preference（**用 stage2_s1**） | 2.5万对（dpo_source 抽样）·**单卡跑** | 7-9h | dpo_pairs.jsonl |
 | 5 | Stage 3 DPO（**起始 stage2_s1**） | 2.5万对 | 1.5-2h | ckpt/stage3 |
 | 6 | 评估 4 档（前 2 档） | 1.89万 × 2 + batch gen | 6-7h | eval_base / eval_s2_only |
 | 7 | 评估 4 档（后 2 档） | 1.89万 × 2 + batch gen | 6-7h | eval_s1_s2 / eval_stage3 |
@@ -91,13 +91,16 @@ torchrun --nproc_per_node=4 $CODE_DIR/stage2_sft.py \
   --max_len 2048 --max_steps 60 --max_samples 100 \
   --per_device_batch 4 --grad_accum 4
 
-# Step 3: build_preference 冒烟（50 pairs，4 卡已加 sharding）
-torchrun --nproc_per_node=4 $CODE_DIR/build_preference.py \
+# Step 3: build_preference 冒烟（50 pairs。**此脚本为生成式推理、DDP 多卡会在 4 进程同时加载全量
+# 7B model+ref → 走 OOM。代码已加 hard assert（WORLD_SIZE>1 直接 RuntimeError），必须单卡跑。**
+# 50 对 生成量不大，单卡~5min 出文件。多卡加速场景建议改用 vLLM 而不是 DDP，该方案不在本项目范围内。）
+python $CODE_DIR/build_preference.py \
   --model_path $MODEL_7B --stage2_dir $WORK_DIR/ckpt/stage2_smoke \
   --data_dir $DATA_DIR --output_dir $WORK_DIR \
   --max_pairs 50
 
-# Step 4: Stage 3 DPO 冒烟（20 步，100 pairs）
+# Step 4: Stage 3 DPO 冒烟（20 步，100 pairs。烟测 peak≈26.8GiB/卡、4 卡 40G A100 余量充足，
+# 仍走 DDP。与 build_preference（强制单卡）区别清楚。
 torchrun --nproc_per_node=4 $CODE_DIR/stage3_dpo.py \
   --model_path $MODEL_7B --stage2_dir $WORK_DIR/ckpt/stage2_smoke \
   --data_dir $DATA_DIR \
@@ -181,7 +184,9 @@ torchrun --nproc_per_node=4 $CODE_DIR/stage2_sft.py \
 **目的**：构造 DPO 偏好对（chosen=标准答案 / rejected=stage2-on-policy 采样）。
 
 ```bash
-torchrun --nproc_per_node=4 $CODE_DIR/build_preference.py \
+# 【强制单卡】生成式脚本多卡会 OOM。代码内有 hard assert（WORLD_SIZE>1 直接 RuntimeError）。
+# 2.5万对 7B 4bit + 高温度采样 单卡 7-9h，仍能在一晚内完成。加速请走 vLLM，该方案不在本项目范围。
+python $CODE_DIR/build_preference.py \
   --model_path $MODEL_7B --stage2_dir /path/to/stage2-s1-adapter \
   --data_dir $DATA_DIR \
   --output_dir $WORK_DIR \
@@ -191,8 +196,10 @@ torchrun --nproc_per_node=4 $CODE_DIR/build_preference.py \
 
 **配置说明**：
 - 2.5万对从 11.2万 dpo_source 抽样（脚本内部按顺序取前 25000）
-- 4 卡 sharding：6250/卡 × ~2.5s ≈ 4.3h
-- **路径 B（推荐）：rejected 用 stage2_s1**（path B——pipeline 沿 stage2_s1起点，部署场景一致；stage2_only 仍训练仅为消融①）
+- 单卡运行（代码内 bring硬 assert拒绝多卡）：6250/decode × 2.5s ≈ 7h。曾在 4 卡跑时
+  4 进程同时加载 base+adapter (×2)，3-4 卡 OOM 退出 → 弹性 launcher 60s 超时后 SIGTERM rank 0，
+  留下 "未找到 .rank* 文件" 误导错误。
+- **路径 B（推荐）：rejected 用 stage2_s1**（path B——pipeline 沿 stage2_s1 起点，部署场景一致；stage2_only 仍训练仅为消融①）
 
 **产出**：dpo_pairs.jsonl → **下载作为晚 5 input**
 
@@ -214,7 +221,9 @@ torchrun --nproc_per_node=4 $CODE_DIR/stage3_dpo.py \
 **配置说明**：
 - 2.5万对 × 1 epoch
 - batch 4 + grad_accum 4 = global batch 64
-- max_len 1024：DPO 双模型 × 2 序列，激活 4 路；7B 4bit 1024 实测 13.4GiB/卡
+- max_len 1024：DPO 双模型 × 2 序列，激活 4 路
+- **烟测 peak=26.8GiB/卡**（代码已优化：logits不升为 fp32 全张；ref_model.no_grad 避免保留中间层
+  autograd graph；policy+ref 双重 grad checkpoint）。余量充足，能在正式数据上安全跑动。
 - 391 步 × 13.5s ≈ 1.5h
 
 **产出**：ckpt/stage3 → **下载作为晚 7 input**
@@ -276,7 +285,7 @@ eval/evaluate.py --model_name stage3   --OMICS all_omics --input_file_path $WORK
 | 1 | Stage 1 | 4-5h | 23.6万 全量, batch 4, grad_accum 4 |
 | 2 | Stage 2 A | 5-6h | 28.98万 全量, batch 4, grad_accum 4, max_len 2048 |
 | 3 | Stage 2 B | 5-6h | 同 A + `--resume_adapter` |
-| 4 | build_preference | 4-5h | 2.5万对（4 卡 sharding） |
+| 4 | build_preference | 7-9h | 2.5万对（**强制单卡**·代码有 hard assert） |
 | 5 | Stage 3 DPO | 1.5-2h | 2.5万对, batch 4, grad_accum 4 |
 | 6 | 评估（2 档） | 6-7h | 2 档 × 1.89万 + batch gen |
 | 7 | 评估（2 档） | 6-7h | 2 档 × 1.89万 + batch gen |
@@ -302,11 +311,11 @@ eval/evaluate.py --model_name stage3   --OMICS all_omics --input_file_path $WORK
 | 风险 | 对策 |
 |---|---|
 | 晚间 commit 失败 / 超时 → working 清空 | 每晚产出**立即下载**到本地 / 推到下一晚 input Dataset |
-| build_preference 4 卡 sharding 失效 | §8.1 给出修复；未加前用 `python` 单卡 + max_pairs 减半 |
+| build_preference 多卡误调 | **强制单卡**·启动时有 hard assert（WORLD_SIZE>1 直接 RuntimeError）；需要加速请用 vLLM 代替（不在本项目范围） |
 | infer_eval 4 卡浪费 | 强制单卡 `python`（脚本无 rank sharding）；加了 batch gen 提速 5× |
 | Stage 1 欠拟合（loss 不降） | 加数据 / 加大 rank / 加 epoch |
 | DPO 后任务指标下降 | β、lr 调小；训练中监控 eval_set |
-| Stage 3 显存紧张 | 7B 4bit 1024 实测 13.4GiB/卡，余量充足；否则降 batch 3 或 max_len 768 |
+| Stage 3 显存紧张 | 7B 4bit 1024 烟测 peak≈26.8GiB/卡，余量充足；logits 路径已优化不转 fp32全张；否则降 batch 1 或 max_len 768 |
 | 评估 batch gen 显存不够 | 降 batch_size 4 或 2；最差回单样本（牺牲速度） |
 | 单晚跑不完 commit | 先 `--max_samples` 跑不完的，回退到合理数据量；adapter 检查点可断点续跑 |
 
@@ -314,9 +323,18 @@ eval/evaluate.py --model_name stage3   --OMICS all_omics --input_file_path $WORK
 
 ## 8. 关键代码补丁
 
-### 8.1 build_preference.py 加 rank sharding（已应用）
+### 8.1 build_preference.py 代码兼容多卡·**运行时强制单卡**
 
-切分 + 各 rank 写 `.rank{i}` + barrier + rank 0 合并 → 4 卡各生成 1/4，全量 2.5万对约 4.3h。
+代码内保留 sharding 同步逻辑（各 rank 写 `.rank{i}` + barrier + rank 0 合并），以备未来 vLLM
+等批量推理场景复用。**入口加了硬 assert**：`if WORLD_SIZE > 1: raise RuntimeError(...)`。
+
+调测中发现：4 卡 DDP 会让每进程同时加载 7B base+adapter，3-4 卡 OOM 退出 ⇒ elastic launcher
+60s 超时后 SIGTERM rank 0，留下 "未找到 .rank* 文件" 误导性错误（实际生成未跑起来）。
+
+- **运行时**：必须 `python train/build_preference.py ...`（WORLD_SIZE 不设）
+- **代码逻辑**：sharding merge 代码块保留备用（不依赖 torchrun）
+
+**冒烟耗时参考**：50 对 单卡 ~5min。2.5万对 全量 单卡 ~7-9h。
 
 ### 8.2 infer_eval.py 加 batch generation（已应用）
 
@@ -335,7 +353,7 @@ common.py `add_lora` 显式 `gradient_checkpointing_kwargs={"use_reentrant": Fal
 ## 9. 执行清单
 
 - [ ] 准备 environment（`pip install -q transformers peft bitsandbytes accelerate datasets sentencepiece`）
-- [ ] **代码补丁已应用**：build_preference 加 rank sharding（§8.1）+ infer_eval 加 batch gen（§8.2）+ use_reentrant 修复（§8.3）
+- [ ] **代码补丁已应用**：build_preference 强制单卡 assert（§8.1）+ infer_eval 加 batch gen（§8.2）+ use_reentrant 修复（§8.3）+ DPO 显存限制修了 logits .float()（见 TECH_NOTES）
 - [ ] 晚 0：冒烟 5 步通过
 - [ ] 晚 1：Stage 1 → 下载 ckpt/stage1
 - [ ] 晚 2：Stage 2 branch A → 下载 ckpt/stage2_only

@@ -59,6 +59,14 @@ def main():
         args.output_dir = args.data_dir
         print(f"[Pref] --output_dir 未传，默认 = --data_dir = {args.output_dir}")
     sys.stdout.reconfigure(encoding="utf-8")
+    # 【防误用】此脚本是生成式推理，不要跑 torchrun 多卡：DDP 会让每个 rank 都加载全量
+    # policy+ref 双 7B 模型，立刻 OOM。这里 hard assert 抓装误调者。
+    if "WORLD_SIZE" in os.environ and int(os.environ.get("WORLD_SIZE", "1")) > 1:
+        raise RuntimeError(
+            "[Pref] build_preference 不支持 torchrun 多卡（生成式脚本，不需 DDP）。"
+            "\n  请用 `python train/build_preference.py ...` 直接跑。"
+            "\n  如需加速，请改用多卡并行推理框架（vLLM 等）而不是 DDP。"
+        )
     IS_MAIN = int(os.environ.get("LOCAL_RANK", "0")) == 0
     if IS_MAIN:
         print(f"[Pref] 加载 base: {args.model_path} + stage2 adapter: {args.stage2_dir}（生成 rejected 用）")
