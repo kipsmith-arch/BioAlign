@@ -171,9 +171,18 @@ def main():
         # 多卡：merge .rank*；单卡：rank 0 就是 .rank0
         rank_files = sorted(_glob_final.glob(f"{args.output_dir}/{args.out_file}.rank*"))
         if len(rank_files) != world:
-            print(f"[Pref] 警告：期望 {world} 个 .rank* 文件，实际 {len(rank_files)} 个：{rank_files}")
+            print(f"[Pref] 警告：期望 {world} 个 .rank* 文件，实际 {len(rank_files)} 个：{[os.path.basename(p) for p in rank_files]}")
         if not rank_files:
-            raise RuntimeError(f"[Pref] 未找到 .rank* 文件（{args.output_dir}/{args.out_file}.rank*），请检查 build_preference 是否成功写入")
+            # 【二补】merger 之前在 barrier 里错过问题，trace 让使用者能区分"被 elastic SIGTERM
+            # 前中杀死"还是"本身没写入"。列出同目录内容帮使用者诊断路径/cwd 问题。
+            siblings = sorted(_os_final.listdir(args.output_dir)) if _os_final.path.isdir(args.output_dir) else []
+            raise RuntimeError(
+                f"[Pref] 未找到 .rank* 文件（{args.output_dir}/{args.out_file}.rank*），请检查 build_preference 是否成功写入。"
+                f"\n  当前 output_dir 内容: {siblings[:20]}"
+                f"\n  提示：多卡 DDP 跑下如果其他 rank 由于 OOM 或其他异常退出"
+                f"（只 rank 0 写完），elastic launcher 默认 60s 超时后会 SIGTERM 主进程；"
+                f"你可以重新跑一次，或用单卡 world=1 跑（保证 4 个 .rank* 都到位）"
+            )
         # 原子写：先写 .tmp 临时文件，fsync 后原子 rename 到主名
         # （不论单卡还是多卡，都走这步——避免任何场景下产出半合并文件）
         with open(tmp_path, "w", encoding="utf-8") as fout:

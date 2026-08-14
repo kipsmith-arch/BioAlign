@@ -94,6 +94,12 @@ class ProgressCallback(TrainerCallback):
     def on_train_begin(self, args, state, control, **kwargs):
         self.t0 = time.time()
         self.is_main = int(os.environ.get("LOCAL_RANK", "0")) == 0
+        # 【准的】重置本次训练的 peak 采样器。
+        # 在主进程上在 forward/backward 代码量都齐的环境才准确。
+        # max_memory_allocated 本质是从该进程启动以来的高水堆，
+        # 重启后是全重设。多次 on_train_begin 会读上次训 peak。
+        if self.is_main and torch.cuda.is_available():
+            torch.cuda.reset_peak_memory_stats()
 
     def on_log(self, args, state, control, logs, **kwargs):
         if not self.is_main:
@@ -108,11 +114,24 @@ class ProgressCallback(TrainerCallback):
             step_s = f"{gs}/{total}"
         else:
             pct, eta_s, step_s = "?", "?", str(gs)
-        mem = torch.cuda.memory_allocated() / 2 ** 30 if torch.cuda.is_available() else 0
+        # 【准的】原来这里只打 torch.cuda.memory_allocated()——只是那一调祥点，由 optimizer/loss
+        # 反向/create 时不同。只看这个点判不开"OOM 高肤"。现在同时打：
+        #   allocated  : 本进程当前 kernel 正持有的显存（实时）
+        #   reserved   : allocator cache 中被多丒的 padding
+        #   max_allocated : 从本进程启动以来为止最高点（含反向） 才是判 OOM 金标准
+        #   free       : 设备物理剩余（可界估上下 OOM）
+        if torch.cuda.is_available():
+            alloc = torch.cuda.memory_allocated() / 2 ** 30
+            reserved = torch.cuda.memory_reserved() / 2 ** 30
+            max_alloc = torch.cuda.max_memory_allocated() / 2 ** 30
+            free = (torch.cuda.get_device_properties(0).total_memory - torch.cuda.memory_allocated()) / 2 ** 30
+        else:
+            alloc = reserved = max_alloc = free = 0
         loss = logs.get("loss", "?")
         loss_s = f"{loss:.4f}" if isinstance(loss, float) else loss
         print(f"[进度] step {step_s} ({pct}) | loss={loss_s} | "
-              f"已用 {elapsed / 60:.1f}min | ETA {eta_s} | 显存 {mem:.1f}GiB",
+              f"已用 {elapsed / 60:.1f}min | ETA {eta_s} | "
+              f"显存 alloc={alloc:.1f}G reserved={reserved:.1f}G peak={max_alloc:.1f}G free={free:.1f}G",
               flush=True)
 
 

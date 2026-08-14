@@ -68,14 +68,22 @@ def encode_pair(pair, tokenizer, max_len, system_prompt):
 
 
 def token_logprobs(logits, input_ids, labels, pad_token_id):
-    """对每个非 -100 位置计算 log P(token)，返回 (总对数概率, 有效 token 数)。"""
-    logits = logits[:, :-1, :].float()            # (B, T-1, V)
+    """对每个非 -100 位置计算 log P(token)，返回 (总对数概率, 有效 token 数)。
+
+    【显存优化】不 .float() 转为整张 (B, T-1, V) fp32——那在 V=152064 词表下光是 chosen 方向就是
+    ~1.2GiB (2·1024·152064·4B)，与 logits[下一个]、输入的中间表示加在一起同时张在峰值。
+    改为：log_softmax 在原精度上算（bfloat16 下数学等价、手枝 log_softmax 原生支持）→立刻 gather
+    到 (B, T-1) fp32 的 token_logp 来做后续 sum。B T V 全张的中间张量不再出现。
+    """
+    # 避免 logits 跨 forward 被反向（拒绝 explicit .float() 保证 loss 断图）
     targets = input_ids[:, 1:]                    # (B, T-1)
     labels = labels[:, 1:]                        # (B, T-1)
-    logp = F.log_softmax(logits, dim=-1)          # (B, T-1, V)
+    # log_softmax 默认在原 dtype 上算（bf16/fp16 下不需手动 .float()，底层有 kernel）
+    logp = F.log_softmax(logits[:, :-1, :], dim=-1)  # (B, T-1, V)，原 dtype
     token_logp = torch.gather(logp, -1, targets.unsqueeze(-1)).squeeze(-1)  # (B, T-1)
     mask = (labels != -100) & (targets != pad_token_id)
-    total = (token_logp * mask).sum(dim=-1)       # (B,)
+    # sum 转为 fp32 只为数值稳定（全宽度 python 运算在泪为上不会能节省多少）
+    total = (token_logp.float() * mask).sum(dim=-1)     # (B,)
     count = mask.sum(dim=-1).clamp(min=1)
     return total, count
 
@@ -96,21 +104,29 @@ class DPOTrainer(Trainer):
         # 当前策略 π：分别对 chosen / rejected 前向
         logits_c = model(input_ids=inputs["chosen_input_ids"]).logits
         logits_r = model(input_ids=inputs["rejected_input_ids"]).logits
-        # 保险：确保 logits 在计算图里（防御某些极端路径下 loss 断图）
+        # 【防御】显式保留梯度路径（某些 peft/量化组合下从 logits 派生 loss 会失梯度，
+        # 以logits在计算图里的情况下显式打上 requires_grad 保证保险。
+        # 但 为了避免同时在峰值中保留 2×(B,T,V) 的 fp32 副本，这里不 .float()。原有代码
+        # 会 .float() 升为 fp32，全张 (2, 1024, 152064) fp32 ≈ 2·5GiB 显存爆炸。为节约峰值
+        # 保证重构在 token_logprobs 内部。原始代码已删除 .float() 调用。
         logits_c.requires_grad_(True)
         logits_r.requires_grad_(True)
         logp_c, _ = token_logprobs(logits_c, inputs["chosen_input_ids"], inputs["chosen_labels"], pad)
         logp_r, _ = token_logprobs(logits_r, inputs["rejected_input_ids"], inputs["rejected_labels"], pad)
 
-        # 参考策略 π_ref（冻结）
+        # 参考策略 π_ref（冻结）。ref_model 已被设 .eval() 且有 GC，这里进一步明：
+        # ①关掉反向以免 ref_logits 保留包含中间层的 autograd graph（全是死内存），
+        # ②不需要 .requires_grad_(True)——torch.no_grad() 自动会造成 ref_logits 脱图。
         with torch.no_grad():
             ref_logits_c = self.ref_model(input_ids=inputs["chosen_input_ids"]).logits
             ref_logits_r = self.ref_model(input_ids=inputs["rejected_input_ids"]).logits
             ref_logp_c, _ = token_logprobs(ref_logits_c, inputs["chosen_input_ids"], inputs["chosen_labels"], pad)
             ref_logp_r, _ = token_logprobs(ref_logits_r, inputs["rejected_input_ids"], inputs["rejected_labels"], pad)
 
-        log_ratio_c = logp_c - ref_logp_c
-        log_ratio_r = logp_r - ref_logp_r
+        # 【显存优化】降精度——logp_c/r、ref_logp_c/r 原 dtype 都是 bf16。.float() 后相减
+        # fp32 精度使用。可控的多例化显存节约点。
+        log_ratio_c = (logp_c - ref_logp_c).float()
+        log_ratio_r = (logp_r - ref_logp_r).float()
         loss = -F.logsigmoid(self.beta * (log_ratio_c - log_ratio_r)).mean()
         return (loss, {"loss": loss}) if return_outputs else loss
 
