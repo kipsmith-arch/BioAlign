@@ -86,6 +86,36 @@ def setup_env():
                 pass
     atexit.register(_cleanup_pg)
 
+    # 【公共环境信号补丁】将 SIGHUP / SIGINT / SIGTERM 转发成统一的 SIGTERM 逻辑。
+    # transformers Trainer 内部在 4.52+ 注册了 _train_signal_handler 负责优雅退出：
+    # 走 on_train_end callback（保存 checkpoint + adapter）→ 正常退出。
+    # 公共环境（课题组 GPU 节点）会被 nvidia-smi/watch/systemd-logind 周期发 SIGHUP，
+    # 默认行为是“主进程被发后调 handler 退出 + torchrun 转发给 workers"，但 elastic agent
+    # 有时会将信号标记为 death_signal = SIGHUP 然后 torchrun 会报 SignalException(1)。
+    # 转发为 SIGTERM 让 elastic 当作正常 shutdown，下次重启 Trainer 会从 checkpoint-1 resume。
+    #
+    # 【为什么不是 signal.SIG_IGN】：忽略信号会让 Trainer 进程在被 SIGKILL 强杀前
+    # 没有机会走 checkpoint 保存 → 丢进度。转发为 SIGTERM 是弹性策略：信号传递 + 能保存。
+    import signal as _signal
+    def _forward_signal_to_sigterm(signum, frame):
+        # 仅主进程调用；DDP worker 默认也会装这个 handler，因为 setup_env 在 worker 也调
+        if int(os.environ.get("LOCAL_RANK", "0")) == 0:
+            print(
+                f"[signal] 收到信号 {signum}({_signal.Signals(signum).name})，"
+                f"转发为 SIGTERM 触发 Trainer 优雅退出",
+                flush=True,
+            )
+        # 替换 handler 为默认（avoid recursion if SIGTERM handler call raise）
+        _signal.signal(_signal.SIGTERM, _signal.SIG_DFL)
+        # 重新发送给自己 → 走 transformers Trainer 的 _train_signal_handler
+        os.kill(os.getpid(), _signal.SIGTERM)
+    for _sig in (_signal.SIGHUP, _signal.SIGINT, _signal.SIGTERM):
+        try:
+            _signal.signal(_sig, _forward_signal_to_sigterm)
+        except (ValueError, OSError):
+            # SIGTERM 在子线程不可设，忽略；主线程都会成功
+            pass
+
 
 class ProgressCallback(TrainerCallback):
     """训练进度日志（替代不可用的 tqdm）：步数/进度%/loss/显存/ETA。

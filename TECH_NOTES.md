@@ -315,6 +315,115 @@ disk	物理磁盘（跨主机可见）            ✅ NFS / 共享存储跨主�
 hard assert 的价值在于：错误出现时使用者能立刻定位“误用了 torchrun”，而不是被 “未找到 .rank* 文件”
 误导去查 sharding 代码。
 
+### 2.13 公共环境跑长任务：setsid + < /dev/null + disown 三件套
+
+#### 2.13.1 问题场景
+
+**代中课题组 GPU 节点上跑 5h+ 的训练，跑到 76% 报错**：
+
+```
+[进度] step 3475/4528 (76.7%) | loss=0.4942 | 已用 270.6min | ETA 1.4h | 显存 alloc=8.7G reserved=29.9G peak=18.9G free=30.6G
+...
+Received Signals.SIGHUP death signal, shutting down workers
+torch.distributed.elastic.multiprocessing.api.SignalException: Process 724727 got signal: 1
+```
+
+环境上依然有 step 3000 的 checkpoint（上一轮保存）——但手动重跑**还是可能被杀**。
+
+#### 2.13.2 什么是 SIGHUP
+
+SIGHUP（信号编号 1）是 POSIX 设计为**通知终端会话退出**的信号：
+
+- SSH 断线 → 内核给会话内所有进程发 SIGHUP
+- 父 shell 被 `exit` / `Ctrl+D` 退出 → 同 SID 下的子进程收到 SIGHUP
+- `nvidia-smi --loop` / `watch` / systemd-logind 等 watchodg 脚本**有时会批量发 SIGHUP**
+- 与之对比：SIGTERM(15) 是“清求终止”、SIGKILL(9) 是“强杀”、SIGINT(2) 是“Ctrl+C”
+
+**信号编号表**：
+
+| 编号 | 名称 | 默认行为 | 触发场景 |
+|---|---|---|---|
+| 1 | SIGHUP | 终止 | 终端退出 |
+| 2 | SIGINT | 终止 | Ctrl+C |
+| 9 | SIGKILL | 终止（不可捕） | OOM Killer / 手动 kill -9 |
+| 15 | SIGTERM | 终止 | kill 默认、systemd shutdown |
+
+**教训**：报错里只看到 “got signal: 1”，要立刻想到 “SIGHUP”，检查是不是会话退出。
+
+#### 2.13.3 三件套是什么
+
+```
+cd $OUT_DIR
+mkdir -p logs
+LOGFILE=$OUT_DIR/logs/stage2_s1_$(date +%H%M).log
+
+setsid torchrun --nproc_per_node=4 $CODE_DIR/stage2_sft.py \
+  ... \
+  > $LOGFILE 2>&1 < /dev/null &
+
+PID=$!
+disown
+echo "[$(date)] torchrun 启动, PID=$PID, 日志=$LOGFILE"
+```
+
+**`setsid`——开新会话**：进程进全新的 session ID 与 process group ID，脱离原控制终端。
+父 shell 被退出 / SSH 断线 时，内核**仅会**给同 SID 下的进程发 SIGHUP。setsid 启动的进程不在你 shell 的 SID 下 → SIGHUP 传不过去。
+
+**`< /dev/null`——切断 stdin**：setsid 启动的进程 stdin 仍可能指向原 tty。后台进程读 stdin 可能阻塞或报 EIO。重定向到 /dev/null 后所有 read() 立刻返回 EOF。**防御性写法**，torchrun 本体不需要，但防止 debug traceback 卡住。
+
+**`disown`——从 bash jobs 表移除**：bash 启动的后台进程会记在内部 jobs 表里，bash 退出时会给每个 job 发 SIGHUP（除非已 setsid/nohup）。disown 从表中抹除，bash exit 时不再尝试发信号。**严格说 setsid 已经免疫 SIGHUP**，disown 是 belt + suspenders，同时避免 fg/bg 误撞。
+
+**`echo "PID: $!"`**：\$! 是 bash 最后一个后台进程 PID，记下供诊断（消失后可用 `dmesg` 查、或者 `ps -ef | grep <PID>`）。
+
+#### 2.13.4 三者对比
+
+| 工具 | 防的是谁 | 作用层级 | 不防什么 |
+|---|---|---|---|
+| `setsid` | 父 shell 退出 / SSH 断 → SIGHUP | 进程组 + 会话 | 手动 kill、OOM Killer |
+| `< /dev/null` | 进程卡在 stdin 读 | 文件描述符 | 其他信号 |
+| `disown` | bash exit 时给 job 发 SIGHUP | bash 内部 jobs 表 | 同 setsid |
+| `echo "PID: $!"` | 无 | 仅记录 | — |
+
+**核心是 setsid**。其他三个是防御性补丁。
+
+#### 2.13.5 为什不使用 nohup / tmux / screen
+
+- `nohup`：只忽略 SIGHUP，**不能脱离原 SID**。父 shell 退出后其他信号还能传进去；多个窗口开 nohup 命令之间互不隔离。不如 setsid 干净。
+- `tmux` / `screen`：重量级，需要进入交互界面。项目使用 setsid + & 更轻量。但是仅个人调试时 tmux **是最容易调试的**（能随时 reattach 看进度）。**二者不互斥**：可以在 tmux 里执行 setsid 命令。
+
+#### 2.13.6 代码侧补丁：信号转发
+
+公共环境的 watchodg 不会被 setsid 挡住（不是从同一个 SID 发的）。代码侧同时加一层防御——在 `common.py::setup_env()` 里转发 SIGHUP/SIGINT/SIGTERM 为 SIGTERM，让 transformers Trainer 的 `_train_signal_handler` 走 on_train_end 保存 checkpoint：
+
+```python
+import signal as _signal
+def _forward_signal_to_sigterm(signum, frame):
+    if int(os.environ.get("LOCAL_RANK", "0")) == 0:
+        print(f"[signal] 收到信号 {signum}({_signal.Signals(signum).name})，转发为 SIGTERM 触发 Trainer 优雅退出", flush=True)
+    _signal.signal(_signal.SIGTERM, _signal.SIG_DFL)
+    os.kill(os.getpid(), _signal.SIGTERM)
+
+for _sig in (_signal.SIGHUP, _signal.SIGINT, _signal.SIGTERM):
+    try:
+        _signal.signal(_sig, _forward_signal_to_sigterm)
+    except (ValueError, OSError):
+        pass
+```
+
+**为什么不是 `SIG_IGN`**：忽略信号会让进程失去保存 checkpoint 的机会，**会被下一个 SIGKILL 强杀时丢全部进度**。SIGTERM 会让 transformers Trainer 走完整退出逻辑——保存 adapter → 退出 → 下次启动从 checkpoint-* 恢复。
+
+#### 2.13.7 重入与续跑
+
+Trainer 默认 `trainer.train()` 不传参时**自动从 `--output_dir` 里最新的 `checkpoint-*` 续跑**。只要：
+
+1. 不动 `--output_dir` 路径
+2. 不删 `checkpoint-*` 目录
+3. Trainer 见到了 checkpoint-* 则 resume；见不到则从 step 1 重跑
+
+所以重跑同一个命令**不需要传任何额外参数**。**别忘了 trainer.save_steps=500（默认）+ save_total_limit=2：坏了只会丢最多 500 步（≈ 30-40 分钟）的进度**，而不是 5h。
+
+【面试可讲】公共环境长任务三件套：setsid（开新 session）+ < /dev/null（断 stdin）+ disown（从 bash jobs 移除）；代码侧信号转发（SIGHUP → SIGTERM）让 Trainer 优雅退出保存 checkpoint。**两者叠加 = 损失最多 500 步进度**，而不是全部丢失。
+
 ---
 
 ## 3. DPO 与 gradient checkpointing 原理（Stage 3 必备知识）

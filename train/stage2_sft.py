@@ -130,6 +130,9 @@ def main():
     trainer.add_callback(ProgressCallback())
     if IS_MAIN:
         print("[Stage2] 开始训练 ...")
+    # 【重入安全】Trainer.train() 不传参时默认从 output_dir 里的 checkpoint-* 最新一个恢复。
+    # 公共环境 SIGHUP/SIGTERM 转发后优雅退出产生的 checkpoint-* 会被自动加载。
+    # save_total_limit=2 只保留 2 个最近的 checkpoint 避免占爆硬盘。
     trainer.train()
     if IS_MAIN:
         print(f"[Stage2] 保存 adapter 到 {args.output_dir}")
