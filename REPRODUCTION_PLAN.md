@@ -78,35 +78,52 @@ WORK_DIR  = /path/to/working        # 或 /kaggle/working
 
 ```bash
 # Step 1: Stage 1 冒烟（30 步，200 条，4 卡 DDP 验证 DDP 路径）
-torchrun --nproc_per_node=4 $CODE_DIR/stage1_pretrain.py \
+# 【公共环境 setsid】烟测也会被 SIGHUP 杀，加 setsid + disown + < /dev/null。
+mkdir -p $WORK_DIR/logs
+LOGFILE=$WORK_DIR/logs/smoke_stage1_$(date +%Y%m%d_%H%M).log
+setsid torchrun --nproc_per_node=4 $CODE_DIR/stage1_pretrain.py \
   --model_path $MODEL_7B --data_dir $DATA_DIR \
   --output_dir $WORK_DIR/ckpt/stage1_smoke \
   --max_len 1024 --max_steps 30 --max_samples 200 \
-  --per_device_batch 4 --grad_accum 4
+  --per_device_batch 4 --grad_accum 4 \
+  > $LOGFILE 2>&1 < /dev/null &
+disown
 
 # Step 2: Stage 2 冒烟（60 步，100 条，max_len 与正式一致 2048——验证长序列代码路径与显存）
-torchrun --nproc_per_node=4 $CODE_DIR/stage2_sft.py \
+mkdir -p $WORK_DIR/logs
+LOGFILE=$WORK_DIR/logs/smoke_stage2_$(date +%Y%m%d_%H%M).log
+setsid torchrun --nproc_per_node=4 $CODE_DIR/stage2_sft.py \
   --model_path $MODEL_7B --data_dir $DATA_DIR \
   --output_dir $WORK_DIR/ckpt/stage2_smoke \
   --max_len 2048 --max_steps 60 --max_samples 100 \
-  --per_device_batch 4 --grad_accum 4
+  --per_device_batch 4 --grad_accum 4 \
+  > $LOGFILE 2>&1 < /dev/null &
+disown
 
 # Step 3: build_preference 冒烟（50 pairs。**此脚本为生成式推理、DDP 多卡会在 4 进程同时加载全量
 # 7B model+ref → 走 OOM。代码已加 hard assert（WORLD_SIZE>1 直接 RuntimeError），必须单卡跑。**
 # 50 对 生成量不大，单卡~5min 出文件。多卡加速场景建议改用 vLLM 而不是 DDP，该方案不在本项目范围内。）
-python $CODE_DIR/build_preference.py \
+mkdir -p $WORK_DIR/logs
+LOGFILE=$WORK_DIR/logs/smoke_buildpref_$(date +%Y%m%d_%H%M).log
+setsid python $CODE_DIR/build_preference.py \
   --model_path $MODEL_7B --stage2_dir $WORK_DIR/ckpt/stage2_smoke \
   --data_dir $DATA_DIR --output_dir $WORK_DIR \
-  --max_pairs 50
+  --max_pairs 50 \
+  > $LOGFILE 2>&1 < /dev/null &
+disown
 
 # Step 4: Stage 3 DPO 冒烟（20 步，100 pairs。烟测 peak≈26.8GiB/卡、4 卡 40G A100 余量充足，
 # 仍走 DDP。与 build_preference（强制单卡）区别清楚。
-torchrun --nproc_per_node=4 $CODE_DIR/stage3_dpo.py \
+mkdir -p $WORK_DIR/logs
+LOGFILE=$WORK_DIR/logs/smoke_stage3_$(date +%Y%m%d_%H%M).log
+setsid torchrun --nproc_per_node=4 $CODE_DIR/stage3_dpo.py \
   --model_path $MODEL_7B --stage2_dir $WORK_DIR/ckpt/stage2_smoke \
   --data_dir $DATA_DIR \
   --output_dir $WORK_DIR/ckpt/stage3_smoke \
   --max_len 1024 --max_samples 100 --max_steps 20 \
-  --per_device_batch 4 --grad_accum 4
+  --per_device_batch 4 --grad_accum 4 \
+  > $LOGFILE 2>&1 < /dev/null &
+disown
 
 # Step 5: infer_eval 冒烟（20 条，单卡，验证 batch gen 路径）
 python $CODE_DIR/infer_eval.py \
@@ -122,12 +139,20 @@ python $CODE_DIR/infer_eval.py \
 **目的**：domain-aware 继续预训练（生物序列）。
 
 ```bash
-torchrun --nproc_per_node=4 $CODE_DIR/stage1_pretrain.py \
+# 【公共环境必须 setsid】长时间训练可能被 SIGHUP 杀（SSH 断 / 父 shell 退出 / watchdog）。
+# setsid 开新 session + disown 从 bash jobs 移除 + < /dev/null 断 stdin。
+# 信号转发在 common.py::setup_env() 也会触发 Trainer 优雅退出、保留 checkpoint-* 供下次 resume。
+mkdir -p $WORK_DIR/logs
+LOGFILE=$WORK_DIR/logs/stage1_$(date +%Y%m%d_%H%M).log
+setsid torchrun --nproc_per_node=4 $CODE_DIR/stage1_pretrain.py \
   --model_path $MODEL_7B --data_dir $DATA_DIR \
   --output_dir $WORK_DIR/ckpt/stage1 \
   --max_len 1024 --epochs 1 \
   --per_device_batch 4 --grad_accum 4 \
-  --lr 1e-4 --lora_plus_scaler 4
+  --lr 1e-4 --lora_plus_scaler 4 \
+  > $LOGFILE 2>&1 < /dev/null &
+disown
+echo "[$(date)] stage1 启动, 日志=$LOGFILE"
 ```
 
 **配置说明**：
@@ -143,12 +168,18 @@ torchrun --nproc_per_node=4 $CODE_DIR/stage1_pretrain.py \
 **目的**：SFT 主力（无 Stage 1）基线。
 
 ```bash
-torchrun --nproc_per_node=4 $CODE_DIR/stage2_sft.py \
+# 【公共环境必须 setsid】长时间训练可能被 SIGHUP 杀。详见晚 1 注释、§8.4。
+mkdir -p $WORK_DIR/logs
+LOGFILE=$WORK_DIR/logs/stage2_only_$(date +%Y%m%d_%H%M).log
+setsid torchrun --nproc_per_node=4 $CODE_DIR/stage2_sft.py \
   --model_path $MODEL_7B --data_dir $DATA_DIR \
   --output_dir $WORK_DIR/ckpt/stage2_only \
   --max_len 2048 --epochs 1 \
   --per_device_batch 4 --grad_accum 4 \
-  --lr 2e-4
+  --lr 2e-4 \
+  > $LOGFILE 2>&1 < /dev/null &
+disown
+echo "[$(date)] stage2_only 启动, 日志=$LOGFILE"
 ```
 
 **配置说明**：
@@ -164,13 +195,19 @@ torchrun --nproc_per_node=4 $CODE_DIR/stage2_sft.py \
 **目的**：给"有 Stage 1"版本，与分支 A 对比得消融①。
 
 ```bash
-torchrun --nproc_per_node=4 $CODE_DIR/stage2_sft.py \
+# 【公共环境必须 setsid】详见晚 1 注释。
+mkdir -p $WORK_DIR/logs
+LOGFILE=$WORK_DIR/logs/stage2_s1_$(date +%Y%m%d_%H%M).log
+setsid torchrun --nproc_per_node=4 $CODE_DIR/stage2_sft.py \
   --model_path $MODEL_7B --data_dir $DATA_DIR \
   --resume_adapter /path/to/stage1-adapter \
   --output_dir $WORK_DIR/ckpt/stage2_s1 \
   --max_len 2048 --epochs 1 \
   --per_device_batch 4 --grad_accum 4 \
-  --lr 2e-4
+  --lr 2e-4 \
+  > $LOGFILE 2>&1 < /dev/null &
+disown
+echo "[$(date)] stage2_s1 启动, 日志=$LOGFILE"
 ```
 
 **与分支 A 的唯一区别**：多 `--resume_adapter`（Stage 1 adapter 路径）。超参完全一致 → 消融①只差"有无 Stage 1"。
@@ -186,12 +223,17 @@ torchrun --nproc_per_node=4 $CODE_DIR/stage2_sft.py \
 ```bash
 # 【强制单卡】生成式脚本多卡会 OOM。代码内有 hard assert（WORLD_SIZE>1 直接 RuntimeError）。
 # 2.5万对 7B 4bit + 高温度采样 单卡 7-9h，仍能在一晚内完成。加速请走 vLLM，该方案不在本项目范围。
-python $CODE_DIR/build_preference.py \
+# 【公共环境 setsid】单卡长任务同样会被 SIGHUP 杀，同晚 1 注释。
+mkdir -p $WORK_DIR/logs
+LOGFILE=$WORK_DIR/logs/buildpref_$(date +%Y%m%d_%H%M).log
+setsid python $CODE_DIR/build_preference.py \
   --model_path $MODEL_7B --stage2_dir /path/to/stage2-s1-adapter \
   --data_dir $DATA_DIR \
   --output_dir $WORK_DIR \
   --max_pairs 25000 \
-  --max_new_tokens 96 --temperature 0.9
+  --max_new_tokens 96 --temperature 0.9 \
+  > $LOGFILE 2>&1 < /dev/null &
+disown
 ```
 
 **配置说明**：
@@ -208,14 +250,20 @@ python $CODE_DIR/build_preference.py \
 **目的**：自实现 DPO，偏好对齐。
 
 ```bash
-torchrun --nproc_per_node=4 $CODE_DIR/stage3_dpo.py \
+# 【公共环境必须 setsid】详见晚 1 注释。
+mkdir -p $WORK_DIR/logs
+LOGFILE=$WORK_DIR/logs/stage3_$(date +%Y%m%d_%H%M).log
+setsid torchrun --nproc_per_node=4 $CODE_DIR/stage3_dpo.py \
   --model_path $MODEL_7B --stage2_dir /path/to/stage2-s1-adapter \
   --data_dir $DATA_DIR \
   --output_dir $WORK_DIR/ckpt/stage3 \
   --dpo_data dpo_pairs.jsonl \
   --max_len 1024 --epochs 1 \
   --per_device_batch 4 --grad_accum 4 \
-  --lr 1e-5 --beta 0.1
+  --lr 1e-5 --beta 0.1 \
+  > $LOGFILE 2>&1 < /dev/null &
+disown
+echo "[$(date)] stage3 启动, 日志=$LOGFILE"
 ```
 
 **配置说明**：
@@ -348,12 +396,24 @@ eval/evaluate.py --model_name stage3   --OMICS all_omics --input_file_path $WORK
 
 common.py `add_lora` 显式 `gradient_checkpointing_kwargs={"use_reentrant": False}` + `setup_env` checkpoint monkey-patch（setdefault + 替换 modeling_utils 引用）。详见 git log `feat(train): 添加transformers兼容性修复`。
 
+### 8.4 公共环境 SIGHUP 免疫：setsid + disown + < /dev/null（已应用）
+
+公共 GPU 节点上跑 5h+ 训练会被 SIGHUP 杀（SSH 断 / 父 shell 退出 / nvidia-smi watchodg 等）。**三件套**：
+
+- `setsid torchrun ...`：开新 session，脱离原控制终端，免疫 SIGHUP
+- `< /dev/null`：断 stdin，防止后台进程读 stdin 阻塞
+- `disown`：从 bash jobs 表移除，bash exit 时不再发送信号
+
+【代码侧补丁】`common.py::setup_env()` 将 SIGHUP / SIGINT / SIGTERM 转发为 SIGTERM，触发 transformers Trainer 的 `_train_signal_handler` 走 `on_train_end` 保存 checkpoint。Trainer 默认从最新 `checkpoint-*` 续跑。
+
+详细原理与现场记录见 [`TECH_NOTES.md` §2.13](TECH_NOTES.md)。所有正式训练命令（晚 1/2/3/5）已使用三件套。
+
 ---
 
 ## 9. 执行清单
 
 - [ ] 准备 environment（`pip install -q transformers peft bitsandbytes accelerate datasets sentencepiece`）
-- [ ] **代码补丁已应用**：build_preference 强制单卡 assert（§8.1）+ infer_eval 加 batch gen（§8.2）+ use_reentrant 修复（§8.3）+ DPO 显存限制修了 logits .float()（见 TECH_NOTES）
+- [ ] **代码补丁已应用**：build_preference 强制单卡 assert（§8.1）+ infer_eval 加 batch gen（§8.2）+ use_reentrant 修复（§8.3）+ SIGHUP 免疫三件套 + 信号转发（§8.4）+ DPO 显存限制修了 logits .float()（见 TECH_NOTES）
 - [ ] 晚 0：冒烟 5 步通过
 - [ ] 晚 1：Stage 1 → 下载 ckpt/stage1
 - [ ] 晚 2：Stage 2 branch A → 下载 ckpt/stage2_only

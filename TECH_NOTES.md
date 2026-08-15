@@ -277,7 +277,7 @@ if "WORLD_SIZE" in os.environ and int(os.environ.get("WORLD_SIZE", "1")) > 1:
 ```bash
 python train/build_preference.py \
   --model_path $MODEL_7B --stage2_dir $STAGE2_ADAPTER \
-  --data_dir $DATA_DIR --output_dir $OUT_DIR \
+  --data_dir $DATA_DIR --output_dir $WORK_DIR \
   --max_pairs 50 --max_samples 50 \
   --max_new_tokens 96 --temperature 0.9 --use_4bit
 ```
@@ -353,9 +353,9 @@ SIGHUP（信号编号 1）是 POSIX 设计为**通知终端会话退出**的信�
 #### 2.13.3 三件套是什么
 
 ```
-cd $OUT_DIR
+cd $WORK_DIR
 mkdir -p logs
-LOGFILE=$OUT_DIR/logs/stage2_s1_$(date +%H%M).log
+LOGFILE=$WORK_DIR/logs/stage2_s1_$(date +%Y%m%d_%H%M).log
 
 setsid torchrun --nproc_per_node=4 $CODE_DIR/stage2_sft.py \
   ... \
