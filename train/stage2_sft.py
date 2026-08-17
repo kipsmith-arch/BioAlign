@@ -17,9 +17,11 @@ label 置为 -100），防止模型学会"复述问题"。
     --lr 2e-4 --max_steps 60 --max_samples 1000 --use_4bit
 """
 import argparse
+import gc
 import sys
 import os
 
+import torch
 from datasets import Dataset
 from peft import PeftModel, prepare_model_for_kbit_training
 from transformers import DataCollatorForSeq2Seq, Trainer, TrainingArguments
@@ -71,6 +73,17 @@ def main():
     if IS_MAIN:
         print(f"[Stage2] 加载模型: {args.model_path} (4bit={args.use_4bit})")
     model, tokenizer = load_model_tokenizer(args.model_path, args.use_4bit, args.max_len)
+    # 【修复 DDP prepare OOM】4bit BNB 加载后，allocator cache 里会有大量未返回的小 block；
+    # DDP 在 _sync_module_states 阶段需要一次性 broadcast ~2 GiB 连续 buffer，
+    # 碎片化会直接 OutOfMemoryError。提前清理一次，把碎片退掉、合并到 reserved。
+    # 每张卡上独立打印，避免主进程单一汇报导致误判"所有卡都缺"。
+    if torch.cuda.is_available():
+        gc.collect()
+        torch.cuda.empty_cache()
+        if IS_MAIN:
+            print(f"[Stage2-pre] post-load-base alloc={torch.cuda.memory_allocated()/2**30:.2f}G "
+                  f"reserved={torch.cuda.memory_reserved()/2**30:.2f}G",
+                  flush=True)
     if args.resume_adapter:
         if IS_MAIN:
             print(f"[Stage2] 从 Stage1 adapter 继续: {args.resume_adapter}")
@@ -89,6 +102,16 @@ def main():
                 p.requires_grad_(True)
     else:
         model = add_lora(model, r=args.lora_r, alpha=args.lora_alpha, dropout=args.lora_dropout)
+        # 【修复 DDP prepare OOM】PEFT add_lora 会调 get_peft_model/get_peft_model_state_dict，
+        # 内部会对 base 做一次 cast/拷贝以注入 LoRA wrapper，BNB 4bit 路径下会产生临时 fp16 张量。
+        # 套完 LoRA 后立刻 gc + empty_cache，把临时 fp16 镜像 release，避免 DDP broadcast 阶段找不到连续 ~2 GiB。
+        if torch.cuda.is_available():
+            gc.collect()
+            torch.cuda.empty_cache()
+            if IS_MAIN:
+                print(f"[Stage2-pre] post-add_lora alloc={torch.cuda.memory_allocated()/2**30:.2f}G "
+                      f"reserved={torch.cuda.memory_reserved()/2**30:.2f}G",
+                      flush=True)
 
     if IS_MAIN:
         print(f"[Stage2] 读取指令数据: {args.data_dir}/{args.train_file}")
