@@ -1,6 +1,7 @@
-# BioAlign —— 基于 QLoRA 与 DPO 的生物医学大模型后训练流水线
+# BioAlign —— 基于 QLoRA 与 DPO 的生物医学大模型后训练流水线（含量化推理闭环）
 
 在 **A100 40GB ×4** 上以 **Qwen2.5-7B-Instruct** 为基座，完整实现大模型后训练（Post-training）三阶段流水线，使通用模型获得多组学（DNA/RNA/蛋白/多分子）生物序列的理解与任务回答能力，并通过偏好对齐提升回答质量。
+**另含量化推理闭环（`infer/`）**：vLLM + bitsandbytes 4-bit + LoRA hot-swap，4 维 benchmark 报告见 `bench/bench_inference.md`。
 
 > 项目早期是 T4 16GB × 3B 设计方案，现已迁移到 A100×4/7B。T4 16GB × 3B 上能跑通三阶段作为指标。
 > 迁移原因：7B 模型在生物领域后训练上具有明显质量优势、A100 40GB×4 为 4-bit QLoRA 提供足够预算（peak≈26.8GiB/卡）。详见 [`REPRODUCTION_PLAN.md`](REPRODUCTION_PLAN.md)。
