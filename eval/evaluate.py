@@ -964,8 +964,8 @@ grouped_data = preprocess_input_data(input_file_path)
 logger.info(f"Grouped data for tasks: {list(grouped_data.keys())}")
 print(f"Grouped data for tasks: {list(grouped_data.keys())}")
 
-# Read task type mapping
-with open("register_tasks.json", "r") as f:
+# Read task type mapping (resolved relative to this script, not the current working directory)
+with open(_SCRIPT_DIR / "register_tasks.json", "r") as f:
     task_type_data = json.load(f)
     
 metrics = {}
@@ -1046,8 +1046,10 @@ for task_name, task_metrics in metrics.items():
     metrics_grouped_by_omics[omics][task_name] = scaled_metrics
 
 
-# Save the metrics (results) to a new JSON file
-metrics_file_path = f"metrics_result/metrics_result_{model_name}_{OMICS}.json"
+# Save the metrics (results) to a new JSON file (relative to cwd; create parent dirs if missing)
+metrics_dir_path = "metrics_result"
+metrics_file_path = f"{metrics_dir_path}/metrics_result_{model_name}_{OMICS}.json"
+os.makedirs(metrics_dir_path, exist_ok=True)
 with open(metrics_file_path, "w") as outfile:
     json.dump(metrics_grouped_by_omics, outfile, indent=4)
 
