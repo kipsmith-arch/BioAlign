@@ -12,6 +12,7 @@ from collections import defaultdict
 import time
 import argparse
 import os
+from pathlib import Path
 
 # Set up argument parser to accept model_name as an argument
 parser = argparse.ArgumentParser(description="Run evaluation script.")
@@ -828,8 +829,9 @@ def count_f1_max(pred, target):
     return all_f1.max()
 
 
-# Read EC labels
-with open("ec_labels.json", "r") as f:
+# Read EC labels (resolved relative to this script, not the current working directory)
+_SCRIPT_DIR = Path(__file__).resolve().parent
+with open(_SCRIPT_DIR / "ec_labels.json", "r") as f:
     ec_labels = json.load(f)
 
 
