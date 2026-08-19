@@ -435,7 +435,7 @@ A: 把 GPU 显存抽象成"页"（类似 OS 虚拟内存）。朴素 KV cache �
 ```
 BioAlign/
 ├── readme.md                       # 项目总览（含三阶段表、技术栈、文档导航）
-├── REPRODUCTION_PLAN.md            # 9 晚节奏 + 各 stage 完整命令 + 关键代码补丁
+├── RUNBOOK.md                      # 9 晚节奏 + 各 stage 完整命令 + 关键代码补丁 + §10 推理加速 benchmark
 ├── TECH_NOTES.md                   # 技术原理笔记（显存换算、SIGHUP、DPO 原理）
 ├── PROJECT_FOR_RESUME.md           # 本文档（简历导向）
 ├── data_prep/

@@ -74,47 +74,23 @@ def classify_by_keywords(text):
     else:
         return None
 
-# Initialize the sentiment analysis model
-MODEL = "../model/twitter-roberta-base-sentiment-latest"
-tokenizer = AutoTokenizer.from_pretrained(MODEL)
-config = AutoConfig.from_pretrained(MODEL)
-model = AutoModelForSequenceClassification.from_pretrained(MODEL)
-model.to('cuda')
+# 本项目改造：删除原仓库硬编码的 twitter-roberta sentiment fallback 模型。
+# 原脚本在二分类任务关键词提取失败时调用情感分类兜底——本项目评估的是
+# 自己的 7B 生物模型生成的 model_output（已含 yes/no），不依赖该 sentiment 模型。
+# 若未来需要该 fallback，再按 README 指引加载 cardiffnlp/twitter-roberta-base-sentiment-latest。
+# tokenizer / config / model / .to('cuda') 均不再需要，classify_by_sentiment_model 也已无 caller 可用。
 
 # Use the sentiment analysis model as fallback if classification by keywords fails
 def classify_by_sentiment_model(text):
-    # Encode the text
-    encoded_inputs = tokenizer(text, padding=True, truncation=True, max_length=512, return_tensors='pt').to('cuda')
-    # print("Encoded inputs:", encoded_inputs)
-    # print("Original text input:", text)
-    
-    # # Ensure input_ids and attention_mask match in size
-    # if encoded_inputs['input_ids'].shape != encoded_inputs['attention_mask'].shape:
-    #         print("Shape mismatch: input_ids shape:", encoded_inputs['input_ids'].shape, 
-    #               "attention_mask shape:", encoded_inputs['attention_mask'].shape)
-            
-    # Get model output (no gradients required)
-    with torch.no_grad():
-        output = model(**encoded_inputs)
-    # print("Model output logits shape:", output.logits.shape) 
-    
-    
-    # Get the logits and apply softmax
-    scores = output.logits.cpu().numpy()
-    scores = softmax(scores, axis=1)
-    # print("Softmax scores:", scores) 
-    
-    # Get the label with the highest probability
-    result_dict = {config.id2label[i]: score for i, score in enumerate(scores[0])}
-    positive_score = result_dict['positive']
-    negative_score = result_dict['negative']
-
-
-    # Determine sentiment (positive=1/negative=0)
-    if positive_score > negative_score:
-        return (1, positive_score)
-    elif negative_score > positive_score:
-        return (0, negative_score)
+    # 本项目改造：原函数依赖外部 sentiment 模型（twitter-roberta-base-sentiment-latest）。
+    # 本项目评估自己的 7B 生物模型输出，正常路径走 yes/no 关键词提取，
+    # 走不到本函数的场景极少（仅当 model_output 既不含 yes/no 也不含 dont_know 时）。
+    # 这里改为返回固定 (0, 0.0)：当作“分类失败 → 按错处理”语义。
+    logger.warning(
+        f"[fallback] classify_by_sentiment_model 被调用但未加载 sentiment 模型。"
+        f"text={text!r}. 固定返回 (0, 0.0)，会当作负样本计错。"
+    )
+    return (0, 0.0)
 
 # Save the processed data for each task in a separate file
 def save_processed_data(model_name, task_name, task_processed_data):

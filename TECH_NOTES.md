@@ -1,7 +1,7 @@
 # 技术笔记（TECH_NOTES）
 
 > 记录本项目开发过程中积累的技术原理、换算关系与设计决策的"为什么"。
-> 与 `REPRODUCTION_PLAN.md`（方案）、`data_prep/README.md`（数据决策）、`train/README.md`（代码）互补——这里是**原理层**笔记。
+> 与 `RUNBOOK.md`（方案）、`data_prep/README.md`（数据决策）、`train/README.md`（代码）互补——这里是**原理层**笔记。
 
 ---
 
@@ -94,7 +94,7 @@ batch、max_len 变动，仅作设计参考——重新启动新训练时仍需�
 
 ## 2. 其他技术要点速查（详细记录见各文档）
 
-### 2.1 冒烟测试方法论（REPRODUCTION_PLAN.md nb2）
+### 2.1 冒烟测试方法论（RUNBOOK.md nb2）
 **只缩数据量/步数，不动超参**（lr/batch/rank/max_len 与正式一致）——冒烟验证的代码路径与正式完全一致，避免"冒烟过了、正式超参没验证"。冒烟不换模型（小数据量冒烟），同一模型同一套代码。
 
 ### 2.2 张量并行 TP vs 数据并行 DDP
