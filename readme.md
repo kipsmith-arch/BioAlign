@@ -33,6 +33,8 @@
 | [`data_prep/README.md`](data_prep/README.md) | 数据管线：三路划分、净化、来源记录、面试问答 |
 | [`train/README.md`](train/README.md) | 训练代码：脚本用法、冒烟记录、bug 清单 |
 | [`eval/README.md`](eval/README.md) | 评估代码（论文官方协议，来源注明） |
+| [`docs/SCRIPT_OUTPUTS.md`](docs/SCRIPT_OUTPUTS.md) | **脚本输出清单**：每个脚本产出哪些文件、内容含义（数据/训练/评估/推理全覆盖） |
+| [`docs/REASON_ANSWER_DECISION.md`](docs/REASON_ANSWER_DECISION.md) | **Reason + Answer 改造决策**：从"自由文 → label"的结构化输出升级，含 Phase 1/2/3 路线、验证步骤、对比表 |
 
 ## 数据与代码位置
 

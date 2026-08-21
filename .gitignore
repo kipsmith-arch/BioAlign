@@ -9,3 +9,6 @@ llm
 ckpt
 dataset
 seq
+*.log
+*.zip
+input_data

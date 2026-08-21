@@ -23,11 +23,129 @@ QWEN_TARGET_MODULES = [
     "gate_proj", "up_proj", "down_proj",
 ]
 
-# 论文 Stage 2 system prompt（Psc）
+
+# Stage 2 system prompt (Reason + Answer version)
+# 设计动机: 原 prompt 只说了 "regression 返回数字", 没说 classification 怎么答,
+# 导致模型学到自然语言描述, 与 eval parser 期望的关键词格式脱节。
+# 下面这个 prompt 明确要求结构化输出: 先 Reason 后 Answer,
+# Answer 严格使用 label 字符串 (parser 能 100% 提取)。
 SYSTEM_PROMPT = (
     "You are a knowledgeable and helpful biology assistant. "
-    "Please answer my biology sequence-related questions clearly and concisely. "
-    "For regression tasks, please return a number."
+    "Please answer my biology sequence-related questions clearly and concisely.\n\n"
+    "FORMAT: Every response MUST contain exactly two sections in this order:\n"
+    "  1. <reason> - a brief justification (1-3 sentences).\n"
+    "  2. <ans> - the final answer, one of:\n"
+    "       * binary classification: positive or negative\n"
+    "       * multi-class classification: the class name (e.g. IRES, EC2.4.1.-, m6A, leader)\n"
+    "       * regression: a single numeric value (e.g. 3.14, -0.5)\n"
+    "       * multi-value regression: hk=0.12, dev=-0.34 or ON=0.3, OFF=0.4, ON_OFF=0.7\n\n"
+    "Example (binary classification):\n"
+    "  <reason>\n"
+    "  The RNA contains AU-rich elements matching the protein RRM domain.\n"
+    "  </reason>\n"
+    "  <ans>\n"
+    "  positive\n"
+    "  </ans>\n\n"
+    "Example (regression):\n"
+    "  <reason>\n"
+    "  Based on sequence composition, predicted thermostability is around 51.\n"
+    "  </reason>\n"
+    "  <ans>\n"
+    "  51.09\n"
+    "  </ans>\n"
+)
+
+# 设计动机: 原 prompt 只说了 "regression 返回数字", 没说 classification 怎么答,
+# 导致模型学到自然语言描述, 与 eval parser 期望的关键词格式脱节。
+# 下面这个 prompt 明确要求结构化输出: 先 Reason 后 Answer,
+# Answer 严格使用 label 字符串 (parser 能 100% 提取)。
+SYSTEM_PROMPT = (
+    "You are a knowledgeable and helpful biology assistant. "
+    "Please answer my biology sequence-related questions clearly and concisely.
+
+"
+    "FORMAT: Every response MUST contain exactly two sections in this order:
+"
+    "  1. <reason> - a brief justification (1-3 sentences).
+"
+    "  2. <ans> - the final answer, one of:
+"
+    "       * binary classification: positive or negative
+"
+    "       * multi-class classification: the class name (e.g. IRES, EC2.4.1.-, m6A, leader)
+"
+    "       * regression: a single numeric value (e.g. 3.14, -0.5)
+"
+    "       * multi-value regression: hk=0.12, dev=-0.34 or ON=0.3, OFF=0.4, ON_OFF=0.7
+
+"
+    "Example (binary classification):
+"
+    "  <reason>
+"
+    "  The RNA contains AU-rich elements matching the protein RRM domain.
+"
+    "  </reason>
+"
+    "  <ans>
+"
+    "  positive
+"
+    "  </ans>
+
+"
+    "Example (regression):
+"
+    "  <reason>
+"
+    "  Based on sequence composition, predicted thermostability is around 51.
+"
+    "  </reason>
+"
+    "  <ans>
+"
+    "  51.09
+"
+    "  </ans>
+"
+)
+# 设计动机: 原 prompt 只说了 "regression 返回数字", 没说 classification 怎么答,
+# 导致模型学到自然语言描述, 与 eval parser 期望的关键词格式脱节。
+# 下面这个 prompt 明确要求结构化输出: 先 Reason 后 Answer,
+# Answer 严格使用 label 字符串 (parser 能 100% 提取)。
+SYSTEM_PROMPT = (
+    "You are a knowledgeable and helpful biology assistant. "
+    "Please answer my biology sequence-related questions clearly and concisely.
+
+"
+    "FORMAT: Every response MUST contain exactly two sections in this order:
+"
+    "  1.  - a brief justification (1-3 sentences).
+"
+    "  2.  - the final answer, one of:
+"
+    "       * binary classification: positive or negative
+"
+    "       * multi-class classification: the class name (e.g. IRES, EC2.4.1.-, m6A, leader)
+"
+    "       * regression: a single numeric value (e.g. 3.14, -0.5)
+"
+    "       * multi-value regression: hk=0.12, dev=-0.34 or ON=0.3, OFF=0.4, ON_OFF=0.7
+
+"
+    "Example (binary classification):
+"
+    "  
+"
+    "  
+
+"
+    "Example (regression):
+"
+    "  
+"
+    "  
+"
 )
 
 
