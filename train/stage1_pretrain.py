@@ -24,6 +24,7 @@ import sys
 import os
 IS_MAIN = int(os.environ.get("LOCAL_RANK", "0")) == 0
 
+import sklearn
 import torch
 from datasets import Dataset
 from transformers import Trainer, TrainingArguments

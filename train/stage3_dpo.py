@@ -32,6 +32,7 @@ import argparse
 import sys
 import os
 
+import sklearn
 import torch
 import torch.nn.functional as F
 from datasets import Dataset

@@ -21,6 +21,7 @@ import gc
 import sys
 import os
 
+import sklearn
 import torch
 from datasets import Dataset
 from peft import PeftModel, prepare_model_for_kbit_training
