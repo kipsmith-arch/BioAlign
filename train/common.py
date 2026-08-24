@@ -14,6 +14,7 @@ import os
 import sys
 import time
 
+import sklearn
 import torch
 from peft import LoraConfig, get_peft_model, prepare_model_for_kbit_training
 from transformers import AutoModelForCausalLM, AutoTokenizer, BitsAndBytesConfig, TrainerCallback
