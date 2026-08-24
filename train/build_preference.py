@@ -21,16 +21,27 @@ build_preference.py —— 自构 DPO 偏好数据（方案 A）
 - rejected 用 stage2 模型 + 较高温度采样
 - 过滤 rejected 与 chosen 相同 / 输出为空的样本（无区分度）
 
-用法（本地 0.5B 冒烟）：
-  python train/build_preference.py \
+引擎选择（--engine）：
+  hf     —— HF transformers + 手动 batching（Windows / 默认，2-4x 提速）
+  vllm   —— vLLM 离线推理（仅 Linux/WSL2，5-10x 提速；7B 25k 对 <1h）
+
+用法（HF 引擎，本地 0.5B 冒烟）：
+  python train/build_preference.py --engine hf \
     --model_path D:/data/programe/AI/LM/Qwen2.5-0.5B-Instruct \
     --stage2_dir ckpt/smoke_stage2 --data_dir data_prep/output --output_dir data_prep/output \
     --max_pairs 50 --max_new_tokens 96 --temperature 0.9 --use_4bit
+
+用法（vLLM 引擎，Linux/WSL2）：
+  python train/build_preference.py --engine vllm \
+    --model_path /path/to/Qwen2.5-7B-Instruct \
+    --stage2_dir ckpt/stage2_s1 --data_dir data_prep/output --output_dir data_prep/output \
+    --max_pairs 25000 --max_new_tokens 96 --temperature 0.9 --vllm_gpu_mem 0.85
 """
 import argparse
 import json
 import sys
 import os
+import time
 
 import sklearn
 import torch
@@ -54,6 +65,18 @@ def main():
     parser.add_argument("--temperature", type=float, default=0.9)
     parser.add_argument("--in_file", type=str, default="dpo_source.jsonl")
     parser.add_argument("--out_file", type=str, default="dpo_pairs.jsonl")
+    # ────── 引擎选择 + 引擎专属参数 ──────
+    parser.add_argument("--engine", choices=["hf", "vllm"], default="hf",
+                        help="推理引擎：hf (Windows 默认，2-4x) / vllm (Linux，5-10x)")
+    parser.add_argument("--hf_batch_size", type=int, default=16,
+                        help="HF 引擎 batching 大小（4090/4060 4bit 默认 16；OOM 降到 8）")
+    parser.add_argument("--vllm_gpu_mem", type=float, default=0.85,
+                        help="vLLM gpu_memory_utilization（4060 8G 用 0.85；OOM 降到 0.7）")
+    parser.add_argument("--vllm_max_model_len", type=int, default=1024,
+                        help="vLLM max_model_len（短 prompt 用 1024 省 KV cache）")
+    parser.add_argument("--vllm_dtype", default="auto",
+                        choices=["auto", "bfloat16", "float16"],
+                        help="vLLM 模型 dtype；4060 bf16 不支持会 fallback fp16")
     args = parser.parse_args()
     # 默认 = data_dir（与 stage3_dpo --data_dir 一致，能在同目录找到产出）
     if args.output_dir is None:
@@ -62,6 +85,7 @@ def main():
     sys.stdout.reconfigure(encoding="utf-8")
     # 【防误用】此脚本是生成式推理，不要跑 torchrun 多卡：DDP 会让每个 rank 都加载全量
     # policy+ref 双 7B 模型，立刻 OOM。这里 hard assert 抓装误调者。
+    # （vLLM 多卡请传 tensor_parallel_size，不要用 torchrun——vLLM 自己管进程组。）
     if "WORLD_SIZE" in os.environ and int(os.environ.get("WORLD_SIZE", "1")) > 1:
         raise RuntimeError(
             "[Pref] build_preference 不支持 torchrun 多卡（生成式脚本，不需 DDP）。"
@@ -69,11 +93,92 @@ def main():
             "\n  如需加速，请改用多卡并行推理框架（vLLM 等）而不是 DDP。"
         )
     IS_MAIN = int(os.environ.get("LOCAL_RANK", "0")) == 0
-    if IS_MAIN:
-        print(f"[Pref] 加载 base: {args.model_path} + stage2 adapter: {args.stage2_dir}（生成 rejected 用）")
-    model, tokenizer = load_model_tokenizer(args.model_path, args.use_4bit, args.max_len)
-    model = PeftModel.from_pretrained(model, args.stage2_dir)
-    model.eval()
+
+    # ─────────────── 引擎选择：HF vs vLLM ───────────────
+    # 关键区别：
+    #   HF     —— PeftModel 加载 LoRA，model.generate() 串行 batch（手动 padding）
+    #   vLLM   —— 把 stage2 LoRA adapter merge 进 vLLM 引擎，llm.generate() 一次送所有 prompt
+    #
+    # vLLM 在 Windows 下不能 import（vllm._C 扩展未编译），必须 Linux/WSL2。
+    # Windows 选了 vllm 在加载阶段就会 ImportError 而报错，不会走到生成循环。
+    if args.engine == "vllm":
+        if IS_MAIN:
+            print(f"[Pref] engine=vllm | base: {args.model_path} | LoRA: {args.stage2_dir} | "
+                  f"gpu_mem={args.vllm_gpu_mem} max_len={args.vllm_max_model_len}")
+        from vllm import LLM, SamplingParams
+        from vllm.lora.request import LoRARequest
+        # vLLM dtype：4060 是 Ada Lovelace 架构，bf16 支持但 vLLM 偶有兼容问题，默认 auto
+        # 让 vLLM 自己选（通常 fp16）；显存充裕且要一致行为时传 bfloat16。
+        vllm_dtype = None if args.vllm_dtype == "auto" else args.vllm_dtype
+        llm = LLM(
+            model=args.model_path,
+            enable_lora=True,
+            max_lora_rank=64,  # 覆盖常见 LoRA r=16/32/64；stage2 用 r=16
+            max_model_len=args.vllm_max_model_len,
+            gpu_memory_utilization=args.vllm_gpu_mem,
+            dtype=vllm_dtype,
+            trust_remote_code=True,
+            # 重要：不要传 quantization="bitsandbytes"——4060 8G 跑 7B 4bit 用 vLLM 加载比 HF 慢且不稳；
+            # 如要 4bit，在 --model_path 直接传 GPTQ/AWQ 量化模型路径，这里保持 bf16。
+        )
+        # 注册 LoRA：vLLM 每次 generate 用 lora_request 参数挑一个 adapter；
+        # 这里只有 stage2 一个，所以建一次复用。
+        lora_req = LoRARequest("stage2", 1, args.stage2_dir)
+        sampling_params = SamplingParams(
+            temperature=args.temperature,
+            top_p=0.9,
+            max_tokens=args.max_new_tokens,
+        )
+        # vLLM 没有传统意义上的 tokenizer 对象，需要单独拿 apply_chat_template 的能力；
+        # transformers tokenizer 仍可独立加载用于拼 prompt 文本。
+        from transformers import AutoTokenizer
+        tokenizer = AutoTokenizer.from_pretrained(args.model_path, trust_remote_code=True)
+        if tokenizer.pad_token is None:
+            tokenizer.pad_token = tokenizer.eos_token
+        # 生成函数（vLLM 版本）：一次性送所有 prompt 给 vLLM，输出 RequestOutput 列表。
+        def _generate_batch(prompts):
+            outs = llm.generate(
+                prompts,
+                sampling_params,
+                lora_request=lora_req,
+                use_tqdm=False,  # 避免和外层进度条打架
+            )
+            return [o.outputs[0].text.strip() for o in outs]
+    else:  # hf
+        if IS_MAIN:
+            print(f"[Pref] engine=hf | base: {args.model_path} + LoRA: {args.stage2_dir} | "
+                  f"batch_size={args.hf_batch_size} use_4bit={args.use_4bit}")
+        model, tokenizer = load_model_tokenizer(args.model_path, args.use_4bit, args.max_len)
+        model = PeftModel.from_pretrained(model, args.stage2_dir)
+        model.eval()
+        # 用左侧 padding：generate 时 batch 内 prompt 左对齐 padding，
+        # 这样每个样本的有效 token 都在右侧尾部，generation 一致；右侧 padding 会污染生成起点。
+        tokenizer.padding_side = "left"
+        # 生成函数（HF 版本）：手动 batch + left-padding + model.generate()
+        def _generate_batch(prompts):
+            inputs = tokenizer(
+                prompts,
+                return_tensors="pt",
+                padding=True,
+                truncation=True,
+                max_length=args.max_len,
+            ).to(model.device)
+            with torch.no_grad():
+                gen = model.generate(
+                    **inputs,
+                    max_new_tokens=args.max_new_tokens,
+                    do_sample=True,
+                    temperature=args.temperature,
+                    top_p=0.9,
+                    pad_token_id=tokenizer.pad_token_id,
+                )
+            # 只取 prompt 之后的新 token（按 prompt 长度切片，每个样本各自长度）
+            prompt_len = inputs["input_ids"].shape[1]
+            decoded = []
+            for row in gen:
+                new_ids = row[prompt_len:]
+                decoded.append(tokenizer.decode(new_ids, skip_special_tokens=True).strip())
+            return decoded
 
     rows = read_jsonl(f"{args.data_dir}/{args.in_file}", args.max_pairs)
     if IS_MAIN:
@@ -111,43 +216,51 @@ def main():
                 print(f"[Pref] rank 0 清理其他残留 {old}")
 
     written, skipped = 0, 0
+    # ─────────────── 主循环：按 batch 切片送 _generate_batch ───────────────
+    # HF 路径：batch_size 默认 16（4060 4bit 安全，OOM 降到 8）；
+    # vLLM 路径：batch_size 设大一点（比如 64），因为 vLLM 内部还会再 micro-batch。
+    bs = args.hf_batch_size if args.engine == "hf" else max(args.hf_batch_size * 4, 64)
+    t0 = time.time()
+    last_log_t = t0
     with open(out_path, "w", encoding="utf-8") as f:
-        for i, r in enumerate(rows):
-            # 构造 prompt（system + user，generate 时不加 assistant 前缀，让模型直接续写）
-            msgs = [
-                {"role": "system", "content": SYSTEM_PROMPT},
-                {"role": "user", "content": r["input"]},
-            ]
-            prompt_text = tokenizer.apply_chat_template(
-                msgs, tokenize=False, add_generation_prompt=True)
-            inputs = tokenizer(prompt_text, return_tensors="pt", truncation=True,
-                               max_length=args.max_len).to(model.device)
-            with torch.no_grad():
-                gen = model.generate(
-                    **inputs,
-                    max_new_tokens=args.max_new_tokens,
-                    do_sample=True,
-                    temperature=args.temperature,
-                    top_p=0.9,
-                    pad_token_id=tokenizer.pad_token_id,
-                )
-            gen_ids = gen[0][inputs["input_ids"].shape[1]:]
-            rejected = tokenizer.decode(gen_ids, skip_special_tokens=True).strip()
-
-            chosen = r["output"]
-            # 过滤无区分度样本（rejected 与 chosen 相同 / 空输出）
-            if not rejected or rejected == chosen:
-                skipped += 1
-                continue
-            f.write(json.dumps({
-                "prompt": [{"role": "user", "content": r["input"]}],
-                "chosen": [{"role": "assistant", "content": chosen}],
-                "rejected": [{"role": "assistant", "content": rejected}],
-            }, ensure_ascii=False) + "\n")
-            written += 1
-            if (i + 1) % 50 == 0:
-                if IS_MAIN:
-                    print(f"  已处理 {i+1}/{len(rows)}，有效 {written}，跳过 {skipped}")
+        i = 0
+        while i < len(rows):
+            batch_rows = rows[i:i + bs]
+            # 构造 prompt 文本（chat_template）
+            prompts = []
+            for r in batch_rows:
+                msgs = [
+                    {"role": "system", "content": SYSTEM_PROMPT},
+                    {"role": "user", "content": r["input"]},
+                ]
+                prompts.append(tokenizer.apply_chat_template(
+                    msgs, tokenize=False, add_generation_prompt=True))
+            rejected_list = _generate_batch(prompts)
+            # 逐条写盘（vLLM 一次返回全部，HF 一次返回 bs 个，按 bs 切就够）
+            for r, rejected in zip(batch_rows, rejected_list):
+                chosen = r["output"]
+                # 过滤无区分度样本（rejected 与 chosen 相同 / 空输出）
+                if not rejected or rejected == chosen:
+                    skipped += 1
+                    continue
+                f.write(json.dumps({
+                    "prompt": [{"role": "user", "content": r["input"]}],
+                    "chosen": [{"role": "assistant", "content": chosen}],
+                    "rejected": [{"role": "assistant", "content": rejected}],
+                }, ensure_ascii=False) + "\n")
+                written += 1
+            # 进度日志：每处理 1 个 batch 打一条，含速率 + ETA（每 30s 至少打一条防"沉默"误判）
+            i += len(batch_rows)
+            now = time.time()
+            if IS_MAIN and ((i % max(bs, 50) == 0) or (now - last_log_t > 30)):
+                elapsed = now - t0
+                speed = i / elapsed if elapsed > 0 else 0
+                eta = (len(rows) - i) / speed if speed > 0 else float("inf")
+                print(f"  [进度] {i}/{len(rows)} | 有效 {written} | 跳过 {skipped} | "
+                      f"{speed:.1f} it/s | 已用 {elapsed/60:.1f}min | "
+                      f"ETA {eta/60:.1f}min",
+                      flush=True)
+                last_log_t = now
 
         # fsync 强制落盘：f.close()（with 退出）只 flush Python buffer → OS page cache
         # os.fsync() 才走 OS → 物理磁盘；保证随后 barrier 后 rank 0 能读到完整文件
