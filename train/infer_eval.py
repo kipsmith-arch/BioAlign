@@ -21,6 +21,7 @@ import subprocess
 import sys
 import time
 
+import sklearn
 import torch
 from peft import PeftModel
 

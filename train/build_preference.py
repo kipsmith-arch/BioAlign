@@ -32,6 +32,7 @@ import json
 import sys
 import os
 
+import sklearn
 import torch
 from peft import PeftModel
 
