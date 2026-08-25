@@ -64,6 +64,14 @@ def setup_env():
     DDP 进程组未关闭警告。必须在任何 transformers/torch 导入前调用。"""
     os.environ.setdefault("PYDEVD_DISABLE_FILE_VALIDATION", "1")
     os.environ.setdefault("TOKENIZERS_PARALLELISM", "false")
+    # 【OOM 防御】PyTorch 2.5+ 推荐设置：allocator 允许扩展段大小，避免碎片化
+    # 在训练过程中反复动态分配/释放大张量（DPO 4 路 forward + chunked log_softmax）时，
+    # 默认会预先按块（block）申请显存并保留 pool，碎片会让峰值虚高 2-5 GiB。
+    # expandable_segments:True 让 allocator 按需扩展、释放后归还，PyTorch 官方在 OOM
+    # 报错信息中直接推荐此选项（"If reserved but unallocated memory is large try setting
+    # PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True to avoid fragmentation"）。
+    # 必须 setdefault——允许用户在外部 shell 覆盖设置。
+    os.environ.setdefault("PYTORCH_CUDA_ALLOC_CONF", "expandable_segments:True")
     # 降低 transformers/peft 库的日志级别（避免 "Loading checkpoint shards" 等重复噪音）
     # 注意：accelerate 的 TP warnings 不抑制——那是真问题，需在加载后清空 _tp_plan
     import logging
