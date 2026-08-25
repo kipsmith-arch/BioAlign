@@ -256,11 +256,13 @@ def main():
     # 【性能优化】dataset.map 并行处理 encode_pair（原 list comprehension 单线程）
     _ds_raw = Dataset.from_list(rows)
     def _encode_batch(batch):
-        """批量调用 encode_pair。map 的 batched=True 模式要求返回 dict[str, list]。"""
+        """批量调用 encode_pair。map 的 batched=True 模式下，batch[col] 是 list[col_per_row]：
+        batch["prompt"][i] 就是第 i 条样本的 list-of-dict（[{role, content}]），
+        不要再外包一层 list，否则 encode_pair 里 [0]["content"] 会取错层。"""
         out = {"chosen_input_ids": [], "chosen_labels": [],
                "rejected_input_ids": [], "rejected_labels": []}
         for prompt, chosen, rejected in zip(batch["prompt"], batch["chosen"], batch["rejected"]):
-            pair_dict = {"prompt": [prompt], "chosen": [chosen], "rejected": [rejected]}
+            pair_dict = {"prompt": prompt, "chosen": chosen, "rejected": rejected}
             r = encode_pair(pair_dict, tokenizer, args.max_len, SYSTEM_PROMPT)
             for k in out:
                 out[k].append(r[k])
