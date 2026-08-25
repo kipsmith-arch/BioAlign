@@ -29,6 +29,7 @@ stage3_dpo.py —— Stage 3: RL（DPO 偏好对齐，自实现 DPO loss）
     --lr 1e-5 --beta 0.1 --max_steps 20 --max_samples 100 --use_4bit
 """
 import argparse
+import gc
 import sys
 import os
 
@@ -36,7 +37,7 @@ import sklearn
 import torch
 import torch.nn.functional as F
 from datasets import Dataset
-from peft import PeftModel
+from peft import PeftModel, prepare_model_for_kbit_training
 from transformers import Trainer, TrainingArguments
 
 sys.path.insert(0, __file__.rsplit("/", 1)[0])
@@ -105,13 +106,12 @@ class DPOTrainer(Trainer):
         # 当前策略 π：分别对 chosen / rejected 前向
         logits_c = model(input_ids=inputs["chosen_input_ids"]).logits
         logits_r = model(input_ids=inputs["rejected_input_ids"]).logits
-        # 【防御】显式保留梯度路径（某些 peft/量化组合下从 logits 派生 loss 会失梯度，
-        # 以logits在计算图里的情况下显式打上 requires_grad 保证保险。
-        # 但 为了避免同时在峰值中保留 2×(B,T,V) 的 fp32 副本，这里不 .float()。原有代码
-        # 会 .float() 升为 fp32，全张 (2, 1024, 152064) fp32 ≈ 2·5GiB 显存爆炸。为节约峰值
-        # 保证重构在 token_logprobs 内部。原始代码已删除 .float() 调用。
-        logits_c.requires_grad_(True)
-        logits_r.requires_grad_(True)
+        # logits 本就在计算图里（model 输出 requires_grad=True），无需显式 .requires_grad_(True)。
+        # 删掉那两行 no-op 后显存峰值直接受益——.requires_grad_ 内部会创建一个新 Tensor 的
+        # autograd 元数据对象（不影响 forward，但累积不是零成本，且语义上误导后人）。
+        # 同样不 .float() 升为 fp32：全张 (B, T, V) fp32 在 V=152064 下 chosen+rejected 两份
+        # ≈ 2×5GiB 显存爆炸。log_softmax 默认在原 dtype（bf16）下算，数学等价；token 级
+        # 概率求和时再 .float() 升精度。详见 token_logprobs() 注释。
         logp_c, _ = token_logprobs(logits_c, inputs["chosen_input_ids"], inputs["chosen_labels"], pad)
         logp_r, _ = token_logprobs(logits_r, inputs["rejected_input_ids"], inputs["rejected_labels"], pad)
 
@@ -172,19 +172,47 @@ def main():
         print(f"[Stage3] 加载 base: {args.model_path} + stage2 adapter: {args.stage2_dir}")
     model, tokenizer = load_model_tokenizer(args.model_path, args.use_4bit, args.max_len)
     model = PeftModel.from_pretrained(model, args.stage2_dir)   # 可训练（更新 stage2 adapter）
+    # 【OOM 修复】PeftModel.from_pretrained 后必须重新跑 prepare_model_for_kbit_training：
+    #   1) enable_input_require_grads → 让 embedding 输出 requires_grad=True，否则 grad checkpoint
+    #      重新前向时 LoRA→base 梯度链断裂，autograd 检测到 require_grad 路径不全，会强制保留
+    #      整张激活图（base 7B 的激活直接吃满显存，这是 step225 撞 OOM 的根因之一）。
+    #   2) cast LayerNorm 到 fp32 → 4bit QLoRA 标准做法，缺了会精度崩坏。
+    #   和 stage2_sft.py --resume_adapter 路径完全对齐——stage3 续训 stage2 adapter 也得重做。
+    model = prepare_model_for_kbit_training(
+        model, gradient_checkpointing_kwargs={"use_reentrant": False})
+    # 显式开 grad checkpoint：DPO 激活是 model+ref 双重 + chosen+rejected 两序列 × 1024 序列，显存大头
+    enable_grad_checkpointing(model)
     # peft 加载后 LoRA 参数 requires_grad 默认 False，显式启用
     for n, p in model.named_parameters():
         if "lora" in n:
             p.requires_grad_(True)
+    # 【OOM 修复】DDP × 4 同时加载两个 4bit 模型（policy + ref），中间不清缓存会让 allocator
+    # 积累大量未返还的小 block。DDP 在 _sync_module_states 阶段需要 broadcast ~2GiB 连续 buffer，
+    # 碎片化直接 OutOfMemoryError。和 stage2_sft.py 行 109-114 的清理时机对齐。
+    if torch.cuda.is_available():
+        gc.collect()
+        torch.cuda.empty_cache()
+        if IS_MAIN:
+            print(f"[Stage3-pre] post-policy-load alloc={torch.cuda.memory_allocated()/2**30:.2f}G "
+                  f"reserved={torch.cuda.memory_reserved()/2**30:.2f}G", flush=True)
     # 参考模型：与 model 相同初始化，单独实例、全冻结
     ref_base, _ = load_model_tokenizer(args.model_path, args.use_4bit, args.max_len)
     ref_model = PeftModel.from_pretrained(ref_base, args.stage2_dir)
-    # 显式开 grad checkpoint：DPO 激活是 model+ref 双重 + chosen+rejected 两序列 × 1024 序列，显存大头
-    enable_grad_checkpointing(model)
-    enable_grad_checkpointing(ref_model)
+    # ref 也跑一遍 prepare_model_for_kbit_training：虽然 ref 全冻结、不会反向，但 LN 不 cast 到 fp32
+    # 会让 ref 的 logp 与 policy 的 logp 不在同一数值精度上——β·Δ 在 log 空间上偏差，DPO 收敛不稳。
+    # GC 参数同步传，ref 也会注册 use_reentrant=False 习惯一致。
+    ref_model = prepare_model_for_kbit_training(
+        ref_model, gradient_checkpointing_kwargs={"use_reentrant": False})
     # ref 是冻结副本，必须设 eval 模式（避免 DPOTrainer 误判 ref 也可训练、避免 drop/BN 等行为）
     ref_model.eval()
     model.train()
+    # 加载完两个模型后再清一次缓存，避免进入 train loop 时 allocator 仍持有加载期间的临时 fp16/bf16 副本
+    if torch.cuda.is_available():
+        gc.collect()
+        torch.cuda.empty_cache()
+        if IS_MAIN:
+            print(f"[Stage3-pre] post-ref-load alloc={torch.cuda.memory_allocated()/2**30:.2f}G "
+                  f"reserved={torch.cuda.memory_reserved()/2**30:.2f}G", flush=True)
 
     rows = read_jsonl(f"{args.data_dir}/{args.dpo_data}", args.max_samples)
     if IS_MAIN:

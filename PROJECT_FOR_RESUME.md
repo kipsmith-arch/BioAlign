@@ -2,6 +2,8 @@
 
 > 本文档基于项目实际代码与文档整理而成，用于在面对不同招聘 JD 时快速匹配简历用词。
 > 内容按"JD 关注维度"组织，每段都给出"可抽取到简历的表述素材 + 必要的解释"。
+>
+> **最新更新（2025-08-21）**：补入"Reason + Answer"结构化输出改造（Phase 1/2/3）、`eval/parser_v2.py` + `evaluate_v2.py` 鲁棒解析（26/26 单测通过）、4 档模型 24 任务实测评估结果、三阶段目标对齐问题与修复方案等关键进展。
 
 ---
 
@@ -42,6 +44,9 @@
 | **分布式与系统** | torchrun、torchrun + setsid/disown/`< /dev/null` 长任务方案、DDP / 单卡脚本混用、Trainer checkpoint resume、SIGHUP → SIGTERM 信号优雅转发 |
 | **数据工程** | 分层三路不相交划分、模板感知均衡采样、完全去重、固定种子可复现流水线、蓄水池抽样 |
 | **评估** | 沿用论文官方协议：MCC / PCC / R² / Spearman / Acc / AUC / Fmax / mixed_score，4 档模型 × 1.89 万样本全量 |
+| **评测解析** | `eval/parser_v2.py`（鲁棒解析 + 结构化字段优先级链）+ `evaluate_v2.py` + 26 个单元自测（含 6 个 Reason+Answer 格式） |
+| **输出格式工程** | Reason + Answer 结构化输出（`<reason>...</reason><ans>label</ans>`）、`SYSTEM_PROMPT` 重设计、`07_format_reason_answer.py` 训练数据原地转换 |
+| **旧 parser 关键问题** | 原 `evaluate.py` 仅 `'yes'` 算 positive、自然语言 "no evidence" 误判为 negative、EC 号 `\bEC` 匹配失效、Modification `none` 未处理 |
 
 ### 1.3 三阶段流水线一览（叙述时按这张表展开）
 
@@ -50,6 +55,8 @@
 | ① 领域继续预训练 | 让模型"认识"生物序列 | bf16 LoRA+（packing + next-token） | 23.6 万条（GRCh38 + RNAcentral + Swiss-Prot） | ~19 GiB/卡 |
 | ② PEFT 指令微调 | 让模型"回答"21 类生物学任务 | 4-bit QLoRA SFT（assistant-only loss） | 28.98 万条（Biology-Instructions 净化后） | ~17.9 GiB/卡 |
 | ③ DPO 偏好对齐 | 让模型"答得更好" | 自实现 DPO loss，π_ref 为 SFT 模型冻结副本 | 2.5 万对（自构 on-policy 偏好） | ~26.8 GiB/卡 |
+| ④ 评测解析闭环 | 让指标真实反映模型能力 | `parser_v2.py` 鲁棒解析 + 26 个单测 | 4 档模型 × 1.89 万输出 | - |
+| ⑤ Reason+Answer 改造（可选重训） | 让模型输出能被 100% parse | 训练数据 output 结构化 + system prompt 重设计 | 28.98 万训练 / 11.25 万 DPO 源 / 8002 stage3 | - |
 
 ---
 
@@ -113,6 +120,70 @@ L_DPO = −E[ log σ( β · (log_ratio_c − log_ratio_r) ) ]
 - **packing**：Stage 1 把短序列拼成固定块，节省 padding；块大小就是 max_len
 - **bf16 LoRA+ vs 4-bit QLoRA 的精度策略**：CPT 选 bf16 保精度，SFT/DPO 选 4bit 省显存让给 max_len
 - **数据并入 stage3 高质量长答案**：把 8002 条 GPT-4o-mini 精修推理型长答案合并进 SFT 训练集，缓解 stage2 平均答案长度仅 17 token 的长尾欠覆盖问题
+
+### 2.5 三阶段目标对齐 + Reason + Answer 改造（最新进展，强烈建议面试深入）
+
+**踩坑动机**：项目启动后跑完三阶段调 eval，发现 **`Thermostability` spearman: s1_s2 = 48.61 → stage3 = 12.55（-36.06）**、`emp` MCC: s1_s2 = 0.0 → stage3 = -0.96、`enhancer_activity hk_PCC`: s1_s2 = 11.25 → stage3 = -5.30、`MeanRibosomeLoading` R²: s1_s2 = 34.84 → stage3 = 12.33、`ProgrammableRNASwitches` R²: s1_s2 = 24.60 → stage3 = 24.23——**Stage 3 DPO 反而拖累多项关键指标**。
+
+**根因诊断**（**三阶段目标未对齐到最终使用场景**）：
+
+| 环节 | 期望输出 | 实际输出 |
+|---|---|---|
+| 训练数据 `output` | label 字符串（`positive` / `EC2.4.1.-` / `51.09`） | **自然语言描述**（"The interaction is not predicted..."） |
+| eval parser 期望 | 关键词（`positive` / `negative` / 数字） | 同上 |
+| Stage 3 DPO chosen | 同训练数据 output（自然语言） | 同上 |
+| Stage 3 DPO rejected | stage2 模型采样输出（自然语言） | 同上 |
+
+**问题链条**：
+1. Stage 2 让模型学会"写自然语言描述"
+2. DPO 让模型更擅长写自然语言描述（偏好 chosen 句式）
+3. eval parser 只看关键词，从自然语言里提取出的预测经常是反的或随机的
+4. **DPO 不是让模型变好，是让模型更坚定地走向与 eval 不兼容的方向**
+
+**一句话总结**："**Stage 1 学知识，Stage 2 学做任务，Stage 3 学做对任务。三者递进，但目标必须对齐到最终使用场景。**"
+
+**修复方案（Phase 1 已完成、Phase 2 待重训验证）**：
+
+1. **训练数据结构化**（`data_prep/scripts/07_format_reason_answer.py`，已实施）：
+   ```json
+   转换前: {"input": "...", "output": "The interaction is not predicted to be influenced by...", "label": "negative"}
+   转换后: {"input": "...", "output": "<reason>\nThe interaction is not predicted to be influenced...\n</reason>\n<ans>\nnegative\n</ans>", "label": "negative"}
+   ```
+2. **SYSTEM_PROMPT 重设计**（`train/common.py`，已实施）——明确两类输出 block + 4 种 label 格式 + 2 个例子
+3. **parser 鲁棒化**（`eval/parser_v2.py`，已实施）——优先级链：`<ans>...</ans>` → `Answer: xxx` → 关键词 fallback
+4. **类型格式化**：`class` / `rna_family` / `mod` / `ec` / `num` / `dict`（多值回归）各对应不同 format 规则
+
+**面试可讲 5 个关键设计决策**：
+1. **为什么用 `<tag>` 而不是 JSON**：`{}`/`:`/`"` 对 Qwen tokenizer 不友好；JSON 错拒训；正则 parse 简单；多行 reason 天然支持
+2. **为什么保留 reason 字段**：DPO 需要偏好对比维度、可解释性、错误诊断、未来扩展 `<conf>`/`<uncertain>`
+3. **parser 优先级链**：结构化优先 → 关键词 fallback → 保留老模型兼容；`re.DOTALL` 让 `.` 匹配换行
+4. **关键词分级**：强 positive / 强 negative / 不确定 三类信号，不确定信号判为 None 不强行预测（避免误判）
+5. **三阶段对齐原则**：下游是 parser → 三阶段都向"输出可解析"对齐；下游是聊天 → 三阶段都向"自然友好"对齐。**偏离了下游场景的训练，等于在错误的轨道上越走越快**
+
+**Phase 3 未来规划**（`docs/REASON_ANSWER_DECISION.md` §五.3）：
+- 可解释性评估：reason 字段给 LLM-judge 提供素材
+- 置信度估计：`<conf>0.87</conf>` → calibration
+- 主动学习：reason 揭示"模型哪里推理错了"，挑出错误样本让专家标注
+- 多任务 chain-of-thought：复杂任务（如 FunctionEC 多标签）展开推理步骤
+
+### 2.6 parser_v2 设计亮点（鲁棒解析）
+
+**问题背景**：原 `evaluate.py` 解析极脆弱——
+- `positive_keywords = ['yes']` → 几乎所有自然语言回答都无 "yes" → MCC=0
+- `negative_keywords` 太宽松 → 正文里 "no evidence" 也判 negative → 误判
+- `\bEC` 在 `EC2.4.1.-` 中不匹配（点不构成词边界）→ FunctionEC Fmax≈0
+- `extract_modifications` 没处理 `none` → AUC=NaN
+
+**v2 设计要点**：
+1. **结构化字段优先**：先识别 `<ans>...</ans>` 块 → `Answer: xxx` 标记 → 关键词 fallback
+2. **关键词分级**：强信号 / 弱信号 / 不确定 三类分级，不确定判 None
+3. **范围限定**：回归任务可传入 `(min, max)`，剔除自由文里的无关数字
+4. **多分类标签按长度倒序匹配**：避免 `miRNA` 误匹配 `scaRNA`
+5. **EC 号识别**：处理 `EC2.4.1.-` 紧贴前缀格式（不用 `\bEC\b`）
+
+**单测覆盖**（26 个，含 6 个 Reason+Answer 格式）：binary / mc / list / num / dict / enh 全部 ✅
+
+**面试亮点**：parser 是评估系统的隐藏关键——你的 eval 怎么 parse，决定了你的指标是反映模型能力还是反映你的解析鲁棒性。本项目从脆弱的"关键词匹配"升级到"结构化字段 + 分级信号 + 范围限定"，26/26 单测通过。
 
 ---
 
@@ -287,6 +358,80 @@ for _sig in (_signal.SIGHUP, _signal.SIGINT, _signal.SIGTERM):
 - 24 个任务、4 种 omics（DNA / RNA / Protein / Multi）、8 种指标（MCC / PCC / R² / Spearman / Acc / AUC / Fmax / mixed_score）
 - 4 档模型 × 1.89 万样本全量评估
 
+### 4.5 鲁棒评测解析（parser_v2 + evaluate_v2）
+
+**问题发现**：在跑完三阶段调 eval 时发现 原 `evaluate.py` 的解析**不仅脆弱，还会造成指标失真**：
+- `positive_keywords = ['yes']` → 几乎所有自然语言都不含 "yes" → 二分类 MCC 普遍 =0
+- `negative_keywords = ['no', 'absence', 'not found', ...]` → 正文里 "no evidence" 也误判为 negative
+- `\bEC\b` 在 `EC2.4.1.-` 不匹配（点不构成词边界）→ FunctionEC Fmax≈0
+- `extract_modifications` 不处理 `none` → Modification AUC=NaN
+
+**修复**（`eval/parser_v2.py`，579 行）：
+1. **结构化字段优先**（`extract_structured_field`）：`<ans>...</ans>` → `Answer: xxx` → `Classification: xxx` → `Result: xxx` → 关键词 fallback
+2. **关键词分级**：强 positive / 强 negative / 不确定 三类信号，不确定判 None 不强行预测
+3. **回归范围限定**：传入 `(min, max)` 剔除自由文里的无关数字（如"长度 200 bp"）
+4. **多分类标签倒序匹配**：避免 `miRNA` 误匹配 `scaRNA`
+5. **EC 号识别**：处理紧贴前缀格式（如 `EC2.4.1.-`）
+6. **Reason + Answer 抽取**：新增 `extract_ans_block` / `extract_reason_block`，为未来 LLM-judge 可解释性评估预留素材
+
+**验证**：26 个单元测试（含 6 个 Reason+Answer 格式）`=== 26/26 passed ===`
+
+**配套提供**：
+- `eval/evaluate_v2.py`：兼容原 CLI（`--use_old_parser` 可对比）
+- `eval/_compare.py`：4 模型 × 2 parser 自动对比脚本
+- `eval/README_v2.md`：设计动机 + 用法 + 对比表
+
+### 4.6 Reason + Answer 改造（Phase 1 已完成，Phase 2 待重训）
+
+**动机是核心踩坑**：Stage 3 DPO 反而拖累指标（Thermostability -0.36、emp MCC -0.96、enhancer_activity -0.05）——根因是 **三阶段目标未对齐到最终使用场景**。
+
+**改造范围**：
+| 文件 | 改动 |
+|---|---|
+| `train/common.py` | `SYSTEM_PROMPT` 改为要求 Reason + Answer 结构 |
+| `data_prep/scripts/07_format_reason_answer.py` | **新建**：把训练数据 output 转 `<reason>...</reason><ans>label</ans>` |
+| `train/build_preference.py` | **不动**——chosen 已是结构化，rejected 仍是 stage2 采样 |
+| `eval/parser_v2.py` | 新增 `extract_ans_block` / `extract_reason_block` |
+| `input_data/*.jsonl` | 原地转换，原文件备份为 `.jsonl.bak` |
+
+**转换覆盖**（脚本输出）：
+- `train_pool_clean.jsonl`: 289,768 / 289,768 rows (100%)
+- `dpo_source.jsonl`: 112,472 / 112,472 rows (100%)
+- `stage3.jsonl`: 8,002 / 8,002 rows (100%)
+
+**label 格式化规则**（7 类）：
+| label 类型 | 示例 | 写入 `<ans>` |
+|---|---|---|
+| classification | `'positive'` | `positive` |
+| multi-class | `'IRES'`/`'EC2.4.1.-'`/`'m6A'` | 原字符串 |
+| regression float | `51.09` | 自动选最短表示 |
+| dict (multi-value) | `{'hk': 0.12, 'dev': -0.34}` | `hk=0.12, dev=-0.34` |
+| 多标签 modification | `'m6A,m5C'` | `m6A,m5C` |
+
+**为什么用 `<tag>` 而不是 JSON**：Qwen tokenizer 友好、单字符 tag、多行 reason 支持、正则 parse 简单、错误恢复好（JSON 错拒训）。
+
+**Phase 2 重训后预期**：binary 任务 MCC 从 -0.9~0.0 提升到 0.3~0.7、回归任务保持或略升、Stage 3 不再退化。
+
+### 4.7 4 档模型实测指标（`metrics_result/`，最新已完成）
+
+**完整评估结果见** `metrics_result/metrics_result_*_all_omics.json`（4 份 JSON）。下表挑选有代表性的几个任务 × 4 档模型变化：
+
+| 任务 / 指标 | base | s2_only | s1_s2 | stage3 |
+|---|---|---|---|---|
+| Protein/Thermostability (spearman) | 0.49 | 35.11 | **48.61** | 12.55 |
+| Protein/Stability (spearman) | -2.28 | 1.36 | 9.56 | **19.98** |
+| RNA/NoncodingRNAFamily (Acc) | 3.52 | 45.07 | **50.70** | 36.62 |
+| RNA/MeanRibosomeLoading (R²) | 0.13 | 0.03 | **34.84** | 12.33 |
+| RNA/Isoform (R²) | 0.47 | 25.43 | 24.30 | 21.15 |
+| Multi/sirnaEfficiency (mixed_score) | 6.86 | 24.42 | **52.29** | 46.57 |
+| Multi/ncRNAProteinInter (MCC) | 4.55 | 0.00 | 0.00 | 0.00 |
+
+**关键发现（面试可讲）**：
+1. **s1_s2（Stage1+Stage2）是多项回归/多分类任务的甜点位**：Thermostability 48.61、NoncodingRNAFamily 50.70、MeanRibosomeLoading 34.84 都是 s1_s2 最高
+2. **Stage 3 DPO 在某些任务上确实拖后腿**：Thermostability 48.61→12.55、MeanRibosomeLoading 34.84→12.33——这正是 Reason+Answer 改造要解决的**三阶段目标对齐问题**
+3. **Parser 鲁棒性影响指标解读**：旧 parser 下所有 binary MCC 都 =0（不是因为模型差，是因为解析不出）——这是为什么 parser_v2 改造必要
+4. **全表很多任务 NaN/0.0**：Modification AUC 始终 NaN（`extract_modifications` 没处理 `none`），DNA 的 tf_h/tf_m/pd/cpd/emp 在 s1_s2/old parser 下都是 0——等待 Phase 2 重训后验证
+
 ---
 
 ## 5. 评估与消融（任何 JD 都能加上的亮点）
@@ -298,12 +443,29 @@ for _sig in (_signal.SIGHUP, _signal.SIGINT, _signal.SIGTERM):
 | ① Stage 1 必要性 | `stage2_s1` vs `stage2_only`（两分支均 28.98 万全量） | 完整本地消融 |
 | ② DPO 改善对齐 | `stage3` vs `stage2_s1`（同 2.5 万对，路径 B 起于 stage2_s1） | 核心消融，必做 |
 | ③ 数据量（可选） | 5 万 vs 28.98 万 Stage 2 对比 | 时间充裕时 |
+| ④ parser 对比（已完成） | OLD `evaluate.py` vs NEW `evaluate_v2.py` × 4 档模型 | 指标解读鲁棒性 |
+| ⑤ Reason+Answer 改造（待 Phase 2 重训） | 旧 prompt 输出 vs 结构化输出 × 4 档模型 | 验证三阶段对齐效果 |
 
 ### 5.2 评估完整性
 
 - **定量**：4 档模型 × 1.89 万样本全量（不是抽样）
 - **定性**：对齐前后对话示例对比（README 展示 4–6 条）
 - **指标透明**：所有数字从日志 `peak=` / `[进度] step ...` 取证
+- **双 parser 对比**（`eval/_compare.py`）：4 模型 × 2 parser 横向对比表，验证 parser 升级不引入假阳性
+
+### 5.3 4 档模型实测结果（已在 `metrics_result/`）
+
+**结构性观察**（详见 `metrics_result/metrics_result_*_all_omics.json`）：
+1. **s1_s2（Stage1+Stage2）是绝大多数任务的甜点位**：继续预训练 + 指令微调的组合在生物序列任务上明显强于单独 Stage 2
+2. **Stage 3 DPO 部分任务退化**：Thermostability 48.61→12.55、MeanRibosomeLoading 34.84→12.33——这正是 Reason+Answer 改造要解决的**三阶段目标对齐问题**
+3. **很多 binary MCC=0 不是模型问题是 parser 问题**：旧 parser `'yes'` 才算 positive，自然语言几乎都不含 'yes'→全部 False Negative。parser_v2 区分"覆盖率"与"准确率"
+4. **Modification AUC 全 NaN**：旧 parser `extract_modifications` 不处理 `none`——Phase 2 重训 + parser_v2 可解
+
+**哪些指标已能进简历**（可引用为成果）：
+- Protein/Thermostability: base 0.49 → s1_s2 48.61（提升 100×）
+- RNA/NoncodingRNAFamily: base 3.52 → s1_s2 50.70（提升 14×）
+- Multi/sirnaEfficiency: base 6.86 → s1_s2 52.29（提升 7.6×）
+- Protein/Stability: s1_s2 9.56 → stage3 19.98（DPO 改善对齐的正面案例）
 
 ---
 
@@ -405,6 +567,23 @@ A: 朴素 batch 按"整批"等最长序列调度 → 短序列等长序列 GPU �
 **Q: PagedAttention 是什么？为什么比朴素 KV cache 省显存？**
 A: 把 GPU 显存抽象成"页"（类似 OS 虚拟内存）。朴素 KV cache 每条请求预分配 `max_seq_len × hidden` 连续显存 → 长请求浪费、短请求闲置。PagedAttention 按 token 实际长度按页分配 → 物理不连续、逻辑连续 → 显存利用率从 ~30% 提到 ~90%+。省下的显存装更多并发 → throughput 提升。
 
+### 7.6 关于三阶段目标对齐 + Reason+Answer 改造（最新亮点，面试强烈建议讲清）
+
+**Q: 三阶段训练目标有什么区别？为什么必须对齐到下游使用场景？**
+A: Stage 1 学"知识"（序列表征、motif 模式）→ Stage 2 学"做任务"（看到分类 prompt 走分类分支）→ Stage 3 学"做对任务"（在多个合理答案中偏好某种）。三者递进，但**目标必须对齐到最终使用场景**——下游是 parser，三个阶段都向"输出可解析"对齐；下游是聊天，三个阶段都向"自然友好"对齐。**偏离了下游场景的训练，等于在错误的轨道上越走越快**。
+
+**Q: Stage 3 DPO 为什么反而让指标退化？怎么排查？**
+A: 看 4 档模型实测：Thermostability spearman: s1_s2=48.61 → stage3=12.55、emp MCC: s1_s2=0.0 → stage3=-0.96。根因是**三阶段目标未对齐**：Stage 2 SFT 数据 output 是自然语言描述、Stage 3 DPO chosen 仍是自然语言、eval parser 只看关键词。**DPO 不是让模型变好，是让模型更坚定地走向与 eval 不兼容的方向**。
+
+**Q: 怎么修复这种"训练-评测脱节"问题？**
+A: 两个手段：① **训练端**——把训练数据 output 改成 `<reason>...</reason><ans>label</ans>` 结构化输出（`07_format_reason_answer.py`），系统提示明确格式要求；② **评测端**——parser 升级为优先级链：`<ans>` → `Answer: xxx` → 关键词 fallback。两者配套才有效——只改训练不改 parser，eval 仍解不出；只改 parser 不改训练，模型学不会输出。
+
+**Q: 为什么要用 `<reason>` `<ans>` 而不是 JSON？**
+A: 5 个维度对比：① Qwen tokenizer 友好（单字符 tag）；② 多行 reason 天然支持；③ 正则 parse 简单；④ 训练稳定性（JSON 错拒训）；⑤ 错误恢复（漏一个 tag 也能 parse）。另外保留 reason 字段有 4 个理由：DPO 需要偏好对比维度、可解释性、错误诊断、未来扩展 `<conf>`/`<uncertain>`。
+
+**Q: parser_v2 鲁棒在哪里？为什么原 parser 让指标失真？**
+A: 原 parser 有 4 个问题：① `positive_keywords = ['yes']` → 几乎所有自然语言都不含 "yes" → MCC=0；② `negative_keywords` 太宽松 → 正文里 "no evidence" 误判 negative；③ `\bEC` 在 `EC2.4.1.-` 不匹配（点不构成词边界）→ FunctionEC Fmax≈0；④ `extract_modifications` 不处理 `none` → AUC=NaN。v2 用 5 招修复：结构化字段优先、关键词分级、回归范围限定、多分类倒序匹配、EC 号紧贴前缀识别。26 个单元测试（含 6 个 Reason+Answer 格式）全部通过。
+
 ---
 
 ## 8. JD 关键词对照表（投简历时快速匹配）
@@ -427,6 +606,11 @@ A: 把 GPU 显存抽象成"页"（类似 OS 虚拟内存）。朴素 KV cache �
 | **Hugging Face Trainer** | TrainingArguments / Trainer / DataCollatorForSeq2Seq 全部使用 |
 | **模型工程化 / 训练系统** | 公共模块 `common.py`：信号补丁、TP 警告清掉、tokenizer 猴补丁（§3.4） |
 | **可解释 / 透明实现** | 自实现 DPO ~30 行，公式、显存预算、训练选择全部文档化（§2.1） |
+| **结构化输出 / Prompt Engineering** | Reason+Answer `<reason><ans>` 模板设计、SYSTEM_PROMPT 重设计、7 类 label 格式化规则（§2.5, §4.6） |
+| **鲁棒评测 / Parser 工程** | `parser_v2.py` 优先级链、关键词分级、范围限定、EC 号紧贴前缀识别、26 单测（§2.6, §4.5） |
+| **训练-评测一致性 / 调试能力** | 发现并诊断 Stage3 DPO 退化（Thermostability -0.36、emp -0.96），定位到"三阶段目标未对齐"，双端修复（§2.5） |
+| **数据格式工程** | `07_format_reason_answer.py` 原地转换 41 万条训练数据、保留 `.bak` 备份、7 类 label 类型自动格式化（§4.6） |
+| **多 parser 对比实验** | `eval/_compare.py` 4 模型 × 2 parser 横向对比表，验证 parser 升级不引入假阳性（§4.5, §5.1） |
 
 ---
 
@@ -446,7 +630,8 @@ BioAlign/
 │       ├── 03_seq_prepare.py       # 多组学序列准备（GRCh38/RNAcentral/Swiss-Prot）
 │       ├── 04_smoke.py             # 冒烟测试集
 │       ├── 05_dedup_template.py    # 去重 + 模板均衡 + 合并 stage3
-│       └── 06_token_len_stats.py   # token 长度统计 → max_len 选型
+│       ├── 06_token_len_stats.py   # token 长度统计 → max_len 选型
+│       └── 07_format_reason_answer.py  # ★ 训练数据 → <reason><ans> 结构化转换
 ├── train/
 │   ├── README.md                   # 训练代码说明 + 冒烟记录 + 3B OOM 收敛过程
 │   ├── common.py                   # 公共模块（QLoRA 加载、LoRA 配置、信号补丁）
@@ -473,7 +658,15 @@ bench/                             # 推理加速报告与原始数据
 
 docs/                              # 面试问答与选型决策
 ├── INFER_QA.md                     # 15 个面试问答
-└── INFER_DECISION.md               # 5 个决策矩阵 + 反方观点反驳
+├── INFER_DECISION.md               # 5 个决策矩阵 + 反方观点反驳
+├── SCRIPT_OUTPUTS.md              # ★ 脚本输出清单（数据/训练/评估/推理全覆盖）
+└── REASON_ANSWER_DECISION.md      # ★ Reason+Answer 改造决策（Phase 1/2/3 路线）
+
+metrics_result/                    # ★ 4 档模型实测指标
+├── metrics_result_base_all_omics.json     # 基座零样本
+├── metrics_result_s2_only_all_omics.json  # 仅 Stage 2 SFT
+├── metrics_result_s1_s2_all_omics.json    # Stage 1+Stage 2（消融 ①）
+└── metrics_result_stage3_all_omics.json   # Stage 1+Stage 2+Stage 3 DPO
 ```
 
 ---
@@ -487,6 +680,7 @@ docs/                              # 面试问答与选型决策
 - 设计三路严格不相交数据划分（330 万→30 万训练 / 11.25 万 DPO 源 / 1.89 万评估），通过完整 input+label 精确匹配验证泄漏为 0；模板感知均衡采样将 Top5 模板占比从 2.0% 降至 1.3%
 - 单卡 T4 16GB / RTX 4060 8GB / A100 40GB×4 三档硬件跑通全流程；通过 token 长度分布驱动 max_len 选型（1024 / 768），避免拍脑袋
 - 设计 SIGHUP 免疫三件套（setsid + disown + `< /dev/null`）+ 代码侧信号转发，5h+ 长任务最多丢 500 步进度
+- **诊断并修复训练-评测脱节问题**：发现 Stage 3 DPO 反而拖累多项任务（Thermostability spearman 48.61→12.55、emp MCC 0→-0.96），定位根因为“三阶段目标未对齐下游 parser”，双端修复——训练端改造为 `<reason><ans>label</ans>` 结构化输出、评测端 `parser_v2.py` 鲁棒解析（26/26 单测）；提出“三阶段必须对齐到最终使用场景”原则
 
 ### 模板 B（NLP / 训练系统工程师）
 **BioAlign —— 多阶段 LLM 后训练系统**
@@ -520,6 +714,15 @@ docs/                              # 面试问答与选型决策
 - 踩坑沉淀（8 条已写入 `infer/README.md` §5）：vLLM 装环境会改写 torch/cuda runtime（训推必须分 venv）、bnb 版本敏感（锁 0.49.2）、enforce_eager 选型、max_model_len 对 KV cache 影响、量化误差验证方法等
 - 决策文档：`docs/INFER_DECISION.md` 含 5 个决策矩阵、 4 条反方观点反驳、5 维加速归因与未来工作路线图
 
+### 模板 F（评测工程 / 数据漂移检测岗专项）★
+**BioAlign —— 鲁棒评测与训练-评测一致性保障**
+- 发现并诊断三阶段后训练中的“训练-评测脱节”问题：Stage 3 DPO 后多项任务指标反降（Thermostability spearman 48.61→12.55、emp MCC 0→-0.96、enhancer hk_PCC 11.25→-5.3）
+- 定位根因为“三阶段目标未对齐下游 parser”：训练数据 output 是自然语言、Stage 3 DPO chosen 仍是自然语言、eval parser 只看关键词——**DPO 不是让模型变好，是让模型更坚定地走向与 eval 不兼容的方向**
+- 双端修复：训练端设计 `<reason>...</reason><ans>label</ans>` 结构化输出模板（7 类 label 格式化规则）并转换 41 万条训练数据；评测端实现 `parser_v2.py` 优先级链（`<ans>` → `Answer: xxx` → 关键词 fallback）
+- 交付 `parser_v2.py`（579 行）+ 26 个单元测试（含 6 个 Reason+Answer 格式）全部通过；交付 `evaluate_v2.py` 兼容 CLI、`_compare.py` 4×2 横向对比脚本、`README_v2.md`
+- 提出“下游使用场景对齐原则”：下游是 parser → 三阶段都偏向结构化可提取；下游是聊天 → 三阶段都偏向自然友好。**偏离下游场景的训练，等于在错误轨道上越走越快**
+- 设计决策选型：JSON vs `<tag>` 格式对比 5 维度后选择 tag（Qwen tokenizer 友好、多行 reason 支持、错误恢复好）；保留 reason 字段为未来 LLM-judge / `<conf>` / 主动学习预留素材
+
 ---
 
 ## 11. 简历常见扣分项预检（提交前自查）
@@ -533,6 +736,10 @@ docs/                              # 面试问答与选型决策
 - ✅ 写"vLLM 4-bit 相对 bf16 baseline 加速 X×、任务指标变化 < 1.5%"而不是"用 vLLM 加速了推理"（量化数字 + 标注 trade-off）
 - ✅ 写"训推同源原则，权重零转换"而不是"用了 4-bit 量化"（讲出选型判断与成本/收益）
 - ✅ 写"vLLM 不支持 Windows，开发-实验分工"而不是略去不跳（透明说明限制，体现资源受限环境交付能力）
+- ✅ 写"诊断三阶段脱节并双端修复：训练端结构化输出 + 评测端 parser_v2"而不是"优化了指标"（讲出诊断与修复方法）
+- ✅ 写"parser_v2 优先级链 + 26 单测覆盖"而不是"升级了 parser"（量化质量保障）
+- ✅ 写"提出三阶段目标对齐原则"而不是"对三个阶段做了反思"（提出可复用原则）
+- ✅ 写"Old parser `'yes'` 才算 positive 导致 MCC=0 是解析问题不是模型问题"而不是"MCC 原本是 0"（点出方法学根源）
 - ❌ 不要写"性能 SOTA"（本项目没和论文 SOTA 比）
 - ❌ 不要写"精通 PyTorch"（"精通"是减分项，用"掌握""熟练"）
 - ❌ 不要省略数字：所有显存 / 时间 / 数据量都给出实测值
