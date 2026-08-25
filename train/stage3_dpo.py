@@ -171,17 +171,36 @@ class DPOTrainer(Trainer):
 
 
 class DPODataCollator:
-    """分别对 chosen / rejected 序列做 padding（两者长度不同）。"""
+    """chosen / rejected 统一 pad 到 batch 内全局 max_len。
+
+    原因：compute_loss 会 torch.cat([chosen_ids, rejected_ids], dim=0)，
+    cat 要求非 cat 维度严格一致。若 chosen/rejected 各自 pad 到自己的 max_len，
+    两条 T 不同会直接 RuntimeError。
+    统一 pad 到 batch 级 max_len 后，padding 多出来的 token 在 token_logprobs
+    里被 (labels == -100) 和 (targets == pad_token_id) 双重 mask 掉，
+    对 DPO loss 无影响。
+    """
 
     def __init__(self, tokenizer):
         self.tokenizer = tokenizer
 
     def __call__(self, features):
+        # 1) 先按列拆开，分别算 max_len
+        cols = {}
+        for key in ("chosen", "rejected"):
+            cols[key] = {
+                "ids": [f[f"{key}_input_ids"] for f in features],
+                "labels": [f[f"{key}_labels"] for f in features],
+            }
+        # 2) 整个 batch 内 chosen + rejected 一起算 max_len（chosen 和 rejected 也要对齐）
+        max_len = max(
+            max(len(x) for x in cols["chosen"]["ids"]),
+            max(len(x) for x in cols["rejected"]["ids"]),
+        )
+        # 3) 统一 pad 到 max_len
         batch = {}
         for key in ("chosen", "rejected"):
-            ids = [f[f"{key}_input_ids"] for f in features]
-            labels = [f[f"{key}_labels"] for f in features]
-            max_len = max(len(x) for x in ids)
+            ids, labels = cols[key]["ids"], cols[key]["labels"]
             padded_ids, padded_labels = [], []
             for x, y in zip(ids, labels):
                 pad_n = max_len - len(x)

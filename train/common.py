@@ -145,7 +145,9 @@ def setup_env():
         _signal.signal(_signal.SIGTERM, _signal.SIG_DFL)
         # 重新发送给自己 → 走 transformers Trainer 的 _train_signal_handler
         os.kill(os.getpid(), _signal.SIGTERM)
-    for _sig in (_signal.SIGHUP, _signal.SIGINT, _signal.SIGTERM):
+    # 【Windows 兼容】SIGHUP 在 Windows 上不存在（AttributeError），用 getattr 兑底
+    _SIGHUP = getattr(_signal, "SIGHUP", _signal.SIGTERM)
+    for _sig in (_SIGHUP, _signal.SIGINT, _signal.SIGTERM):
         try:
             _signal.signal(_sig, _forward_signal_to_sigterm)
         except (ValueError, OSError):
