@@ -140,28 +140,38 @@ class DPOTrainer(Trainer):
         all_ids = torch.cat([chosen_ids, rejected_ids], dim=0)        # (2B, T)
         all_labels = torch.cat([chosen_labels, rejected_labels], dim=0)  # (2B, T)
 
-        # DDP no_sync 上下文：grad_accum>1 时避免每步 all-reduce
-        no_sync_ctx = (
-            model.no_sync() if self.args.gradient_accumulation_steps > 1
-            and hasattr(model, "no_sync") else __import__("contextlib").nullcontext()
-        )
-        with no_sync_ctx:
-            # 1) policy 前向：1 次 forward（原 2 次）
-            logits = model(input_ids=all_ids).logits  # (2B, T, V) bf16
-            logp_all, _ = token_logprobs(logits, all_ids, all_labels, pad)
-            B = chosen_ids.size(0)
-            logp_c, logp_r = logp_all[:B], logp_all[B:]
-            del logits, logp_all
+        # 【DDP 解包】torch.nn.parallel.DistributedDataParallel 不代理 PeftModel 的自定义方法
+        # （disable_adapter 等），它只在 Module.__getattr__ 的 _modules 里查找子模块名——
+        # 'disable_adapter' 既不是子模块名也不在 _parameters/_buffers 里，所以直接调
+        # `model.disable_adapter()` 在 DDP 下报 AttributeError。
+        #   修法：拿到内层 PeftModel（DDP 用 self.module 持有原模块），用它调 disable_adapter
+        #   和 ref forward；policy forward 仍走 DDP，使梯度同步（all-reduce）正常工作。
+        # 单卡 / 非 DDP 下 `model.module` 不存在，getattr(... , model) 返回 model 本身，行为不变。
+        inner = getattr(model, "module", model)
 
-            # 2) ref 前向：复用同一 base，disable_adapter() 临时禁用 LoRA
-            # inference_mode 比 no_grad 更彻底——禁用 view tracking + autograd metadata
-            with torch.inference_mode():
-                with model.disable_adapter():
-                    ref_logits = model(input_ids=all_ids).logits
-                    ref_logp_all, _ = token_logprobs(
-                        ref_logits, all_ids, all_labels, pad)
-                    ref_logp_c, ref_logp_r = ref_logp_all[:B], ref_logp_all[B:]
-                    del ref_logits, ref_logp_all
+        # 注意：不要在这里再套一层 `with model.no_sync():`——Trainer 4.52.1 的 _inner_training_loop
+        # 已经在外层用 `self.accelerator.no_sync(model)` 正确处理了所有 micro-step 的梯度同步
+        # （除最后一个 micro-step 外都用 no_sync，最后一个正常 all-reduce）。手动再加一层会
+        # 强制最后一个 micro-step 也走 no_sync，导致多卡 DDP 训练梯度永远不 all-reduce——
+        # 各 rank 用本地梯度独立 optimizer.step，模型静默发散（无报错但 loss 不下降）。
+
+        # 1) policy 前向：走 DDP，1 次 forward（原 2 次）
+        logits = model(input_ids=all_ids).logits  # (2B, T, V) bf16
+        logp_all, _ = token_logprobs(logits, all_ids, all_labels, pad)
+        B = chosen_ids.size(0)
+        logp_c, logp_r = logp_all[:B], logp_all[B:]
+        del logits, logp_all
+
+        # 2) ref 前向：复用同一 base，disable_adapter() 临时禁用 LoRA
+        # - 直接调用 inner.forward（绕过 DDP），因为 inference_mode 下不建图，DDP reducer
+        #   状态不会被干扰；DDP reducer 只关心 forward+backward 的 autograd 钩子调用计数。
+        # - inference_mode 比 no_grad 更彻底——禁用 view tracking + autograd metadata。
+        with torch.inference_mode():
+            with inner.disable_adapter():
+                ref_logits = inner(input_ids=all_ids).logits
+                ref_logp_all, _ = token_logprobs(ref_logits, all_ids, all_labels, pad)
+                ref_logp_c, ref_logp_r = ref_logp_all[:B], ref_logp_all[B:]
+                del ref_logits, ref_logp_all
 
         # 3) DPO loss（fp32 精度计算 Δ）
         log_ratio_c = logp_c - ref_logp_c
@@ -328,7 +338,12 @@ def main():
     trainer.train()
     if IS_MAIN:
         print(f"[Stage3] 保存 adapter 到 {args.output_dir}")
-    trainer.model.save_pretrained(args.output_dir)
+    # 【DDP 解包保存】trainer.model 在多卡下是 DistributedDataParallel 包装体，DDP 不代理
+    # PeftModel.save_pretrained（Module.__getattr__ 只查 _parameters/_buffers/_modules 名，
+    # 'save_pretrained' 不在里面）。unwrap 后调内层 PeftModel.save_pretrained 才能正确写出
+    # adapter_config.json / adapter_model.safetensors。单卡下 getattr(..., model) = 原模型。
+    final_model = getattr(trainer.model, "module", trainer.model)
+    final_model.save_pretrained(args.output_dir)
     tokenizer.save_pretrained(args.output_dir)
     if IS_MAIN:
         print("[Stage3] 完成。")
