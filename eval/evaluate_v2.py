@@ -34,16 +34,21 @@ from parser_v2 import (
 # ============================================================
 # CLI
 # ============================================================
+# 与 evaluate.py 的命令行参数保持一致；多出的 v2 专属开关全部用合理默认值。
 parser = argparse.ArgumentParser()
-parser.add_argument('--model_name', required=True)
-parser.add_argument('--OMICS', required=True)
-parser.add_argument('--input_file_path', required=True)
-parser.add_argument('--use_old_parser', action='store_true',
-                    help='回退到 evaluate.py 的旧 parser（用于对比）')
-parser.add_argument('--save_processed_dir', default=None,
-                    help='保存每个任务的 processed data 路径（默认 None 不保存）')
-parser.add_argument('--out_suffix', default='',
-                    help='输出文件后缀（默认空，例如 _v2/_old 用于对比）')
+parser.add_argument('--model_name', required=True, help="Name of the model to load.")
+parser.add_argument('--OMICS', required=True, help="Omics data to process.")
+parser.add_argument('--input_file_path', required=True, help="Input data to process.")
+# 以下三个为 evaluate_v2 相对 evaluate.py 多出的参数，默认值选取使其行为与 evaluate.py 对齐：
+# - use_old_parser: 默认 False，正常使用 v2 parser
+# - save_processed_dir: 默认 'processed_data'，与 evaluate.py 落盘路径一致
+# - out_suffix: 默认 '_v2'，区分 evaluate.py 输出
+parser.add_argument('--use_old_parser', action='store_true', default=False,
+                    help='回退到 evaluate.py 的旧 parser（用于对比，默认 False 使用 v2 parser）')
+parser.add_argument('--save_processed_dir', default='processed_data',
+                    help='保存每个任务的 processed data 路径（默认 processed_data/）')
+parser.add_argument('--out_suffix', default='_v2',
+                    help='输出文件后缀（默认 _v2，与 evaluate.py 输出区分）')
 args = parser.parse_args()
 
 # ============================================================
@@ -613,7 +618,11 @@ def main():
 
     out_dir = Path("metrics_result")
     out_dir.mkdir(exist_ok=True)
-    suffix = args.out_suffix or ("_v2" if not args.use_old_parser else "_old")
+    # 默认追加 _v2 后缀（与 evaluate.py 输出区分）；使用旧 parser 时追加 _old。
+    if args.use_old_parser:
+        suffix = args.out_suffix if args.out_suffix != "_v2" else "_old"
+    else:
+        suffix = args.out_suffix
     out_path = out_dir / f"metrics_result_{args.model_name}_{args.OMICS}{suffix}.json"
     with open(out_path, "w") as f:
         json.dump(out, f, indent=4)
