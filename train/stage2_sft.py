@@ -18,9 +18,11 @@ label 置为 -100），防止模型学会"复述问题"。
 """
 import argparse
 import gc
+import random
 import sys
 import os
 
+import numpy as np
 import sklearn
 import torch
 from datasets import Dataset
@@ -32,6 +34,116 @@ from common import (ProgressCallback, SYSTEM_PROMPT, add_common_args, add_lora,
                     build_lora_plus_optimizer, enable_grad_checkpointing,
                     load_model_tokenizer, read_jsonl, setup_env,
                     setup_output_dir)
+
+
+# ============================================================
+# task_kind() + prefix logic + class_weight
+# ============================================================
+# BioAlign 论文 §4.2 建议：
+#   "we randomly select 30 percent of the training data and prepend a task label in
+#    the format '[Classification/Regression:task name]' at the beginning of each
+#    question. This method effectively aids the model in identifying different
+#    tasks and output objectives."
+# 实现记录：
+#   1) task_kind(r) → 'classification' / 'regression'
+#   2) maybe_add_prefix(r, ratio, rng) → 随机选 30% 样本，在 input 前拼前缀
+#   3) compute_sample_weight(r, weights) → per-sample weight，用于 Trainer.compute_loss
+#      加权 binary 任务的 minority class，逆转 stage2 坍缩到 dominant class 的趋势
+#
+# Class_weight 说明：
+#   本文以 binary 任务为 target（emp-/tf-/pd/cpd/promoter_enhancer/rna_protein/
+#   antibody_antigen/Solubility）；regression/multiclass/dict 任务不加权。
+#   这些任务训练数据本身接近 50/50 平衡，balanced weight 接近 1，所以
+#   class_weight 仅能提供温和修正。但加上是“零成本安全网”（不影响收敛）。
+# ============================================================
+
+# Binary task 名集合——以 label ∈ {positive, negative} 为标志
+BINARY_TASKS = frozenset({
+    "rna_protein_interaction",
+    "antibody_antigen",
+    "Solubility",
+    "tf-h-0", "tf-h-1", "tf-h-2", "tf-h-3", "tf-h-4",
+    "tf-m-0", "tf-m-1", "tf-m-2", "tf-m-3", "tf-m-4",
+    "emp-H3", "emp-H3K4me1", "emp-H3K4me2", "emp-H3K4me3",
+    "emp-H3K9ac", "emp-H3K14ac", "emp-H3K36me3", "emp-H3K79me3",
+    "emp-H4", "emp-H4ac",
+    "pd-prom_300_all", "pd-prom_300_notata", "pd-prom_300_tata",
+    "cpd-prom_core_all", "cpd-prom_core_notata", "cpd-prom_core_tata",
+    "promoter_enhancer_interaction-K562", "promoter_enhancer_interaction-GM12878",
+    "promoter_enhancer_interaction-HeLa-S3", "promoter_enhancer_interaction-HUVEC",
+    "promoter_enhancer_interaction-IMR90", "promoter_enhancer_interaction-NHEK",
+})
+
+
+def task_kind(rec: dict) -> str:
+    """判断任务类型。Binary 任务走特殊 prefix（'Classification'）。"""
+    task = rec.get("task", "")
+    label = rec.get("label", "")
+    if task in BINARY_TASKS or label in ("positive", "negative"):
+        return "Classification"
+    # multi-value regression (dict) 也属于 regression
+    if isinstance(label, dict):
+        return "Regression"
+    try:
+        float(label)
+        return "Regression"
+    except Exception:
+        return "Classification"  # multiclass 也归为 Classification
+
+
+def maybe_add_prefix(rec: dict, ratio: float, rng: random.Random) -> dict:
+    """论文§4.2: 以 ratio 概率为样本加 task prefix。返回新 dict（不修改原 rec）。"""
+    if rng.random() >= ratio:
+        return rec
+    kind = task_kind(rec)
+    task = rec.get("task", "unknown")
+    new_input = f"[{kind}: {task}] " + rec["input"]
+    return {**rec, "input": new_input}
+
+
+def compute_task_weights(rows: list[dict], power: float = 0.5) -> dict[str, float]:
+    """任务间平衡：小任务样本权重高。
+
+    weight[task] = (max_count / count[task]) ** power
+    - power=0   → 全部 1.0（关闭）
+    - power=0.5 → 温和：小任务权重 = sqrt(7.8x) ≈ 2.8x，大任务被轻微压制
+    - power=1.0 → 完全 balanced：小任务 7.8x，大任务被强压制
+
+    动机：train_pool_clean.jsonl 任务间样本量差 7.8x（CRISPROnTarget 1234 条
+    vs sirnaEfficiency 9684 条）；emp 一族占 27.5%。模型会过度关注样本量大的
+    任务，小任务（promoter_enhancer / CRISPROnTarget 等）训练信号不足。
+    """
+    from collections import Counter
+    counts = Counter(r.get("task", "") for r in rows)
+    if not counts:
+        return {}
+    max_c = max(counts.values())
+    return {t: (max_c / c) ** power for t, c in counts.items()}
+
+
+def compute_binary_class_weights(rows: list[dict]) -> dict[tuple[str, str], float]:
+    """对 binary 任务计算每个 (task, label) 的 balanced weight。
+    仅针对二元分类任务；其它任务返回空 dict。
+    """
+    from sklearn.utils.class_weight import compute_class_weight
+    weights = {}
+    # 按 task 聚合 labels
+    by_task: dict[str, list[str]] = {}
+    for r in rows:
+        if task_kind(r) != "Classification":
+            continue
+        # 过滤掉 multiclass 的（label 不是 positive/negative 的）
+        if r.get("label") not in ("positive", "negative"):
+            continue
+        by_task.setdefault(r["task"], []).append(r["label"])
+    for task, labels in by_task.items():
+        unique = sorted(set(labels))
+        if len(unique) < 2:
+            continue  # 单类不需要加权
+        w = compute_class_weight("balanced", classes=np.array(unique), y=np.array(labels))
+        for cls, wi in zip(unique, w):
+            weights[(task, cls)] = float(wi)
+    return weights
 
 
 def encode_sft(item, tokenizer, max_len, system_prompt):
@@ -56,6 +168,61 @@ def encode_sft(item, tokenizer, max_len, system_prompt):
     return {"input_ids": ids_full, "labels": labels}
 
 
+class WeightedSFTCollator:
+    """在 DataCollatorForSeq2Seq 的基础上多塞一个 weight 字段，供 Trainer.compute_loss 使用。
+
+    Trainer 默认 collator 不会保留额外字段，这里手动接力：
+      1) 先用 DataCollatorForSeq2Seq 生成 input_ids / labels / attention_mask
+      2) 再从原 batch 取 weight 字段拼回去
+    """
+
+    def __init__(self, tokenizer, max_len: int):
+        self.tokenizer = tokenizer
+        self.max_len = max_len
+        self.seq2seq = DataCollatorForSeq2Seq(
+            tokenizer, padding=True, label_pad_token_id=-100, max_length=max_len)
+
+    def __call__(self, features):
+        weights = [float(f.get("weight", 1.0)) for f in features]
+        batch = self.seq2seq(features)
+        # seq2seq 保留 input_ids/labels/attention_mask，外加 weight
+        batch["weight"] = torch.tensor(weights, dtype=torch.float32)
+        return batch
+
+
+class WeightedSFTTrainer(Trainer):
+    """自定义 Trainer：实现 per-sample 加权 loss。"""
+
+    def compute_loss(self, model, inputs, return_outputs=False, **kwargs):
+        weights = inputs.pop("weight", None)
+        labels = inputs.get("labels")
+        outputs = model(**inputs)
+        logits = outputs.logits
+        if weights is None:
+            loss = torch.nn.functional.cross_entropy(
+                logits.view(-1, logits.size(-1)),
+                labels.view(-1),
+                ignore_index=-100,
+            )
+        else:
+            # per-token CE → per-sample 平均（跳过 -100）→ 用 per-sample weight 加权平均。
+            # 归一化到 mean(weight)=1：weight 全 1 时严格退化为标准 CE（与 ignore_index 一致）。
+            losses = torch.nn.functional.cross_entropy(
+                logits.view(-1, logits.size(-1)),
+                labels.view(-1),
+                ignore_index=-100,
+                reduction="none",
+            ).view(labels.shape)
+            mask = (labels != -100).float()
+            token_cnt = mask.sum(dim=-1).clamp_min(1.0)
+            per_sample = (losses * mask).sum(dim=-1) / token_cnt
+            w = weights.to(per_sample.device).to(per_sample.dtype)
+            # 归一化：mean(w)=1 → weight=1 时 loss = mean(per_sample)，等于标准 CE（在 token 数相同时）
+            w = w * (per_sample.numel() / w.sum().clamp_min(1e-9))
+            loss = (per_sample * w).sum() / per_sample.numel()
+        return (loss, outputs) if return_outputs else loss
+
+
 def main():
     parser = argparse.ArgumentParser()
     add_common_args(parser)
@@ -64,6 +231,15 @@ def main():
     parser.add_argument("--resume_adapter", type=str, default=None,
                         help="从 Stage 1 的 LoRA adapter 继续训练（stage1+stage2 分支）；"
                              "不传则从基座直接训（stage2-only 分支）")
+    # 【P1】论文§4.2 task prefix + class_weight + task_weight 控制
+    parser.add_argument("--task_prefix_ratio", type=float, default=0.30,
+                        help="论文§4.2 推荐的 task prefix 概率（默认 0.30 = 论文原值）；设为 0 关闭")
+    parser.add_argument("--use_class_weight", action="store_true", default=False,
+                        help="是否对 binary 任务启用 balanced class_weight（计算 sample-level weight）")
+    parser.add_argument("--task_weight_power", type=float, default=0.0,
+                        help="任务间平衡强度：weight[task]=(max_count/count[task])**power。"
+                             "0=关闭（默认）；0.5=温和平衡；1.0=完全 balanced。"
+                             "复用 WeightedSFTTrainer 的 per-sample weight 机制。")
     parser.set_defaults(lora_r=64)  # 两分支统一 rank=64，保证消融①只差“有无 Stage1”
     args = parser.parse_args()
     setup_env()
@@ -120,9 +296,47 @@ def main():
     if IS_MAIN:
         print(f"[Stage2] 样本数: {len(rows)}")
 
-    dataset = Dataset.from_list(
-        [encode_sft(r, tokenizer, args.max_len, SYSTEM_PROMPT) for r in rows])
-    dataset = dataset.filter(lambda x: len(x["input_ids"]) > 0)
+    # 【P1-a】论文§4.2 task prefix：以 30% 概率为样本加 [Classification/Regression: task] 前缀
+    rng = random.Random(args.seed)
+    rows_prefixed = [maybe_add_prefix(r, args.task_prefix_ratio, rng) for r in rows]
+    n_prefixed = sum(1 for a, b in zip(rows_prefixed, rows) if a.get("input") != b.get("input"))
+    if IS_MAIN:
+        print(f"[Stage2] task prefix: {n_prefixed}/{len(rows)} ({n_prefixed/len(rows)*100:.1f}%)")
+    rows = rows_prefixed
+
+    # 【P1-b】class_weight：针对 binary 任务计算 balanced sample weight
+    cw = compute_binary_class_weights(rows) if args.use_class_weight else {}
+    if IS_MAIN:
+        if cw:
+            sample_weights = list(cw.values())
+            print(f"[Stage2] class_weight: {len(cw)} (task, label) pairs, "
+                  f"weight range [{min(sample_weights):.3f}, {max(sample_weights):.3f}]")
+        else:
+            print(f"[Stage2] class_weight: disabled (use_class_weight=False or no binary task)")
+
+    # 【P1-c】task_weight：任务间平衡（小任务样本权重高）
+    tw = compute_task_weights(rows, power=args.task_weight_power) if args.task_weight_power > 0 else {}
+    if IS_MAIN and tw:
+        vals = list(tw.values())
+        print(f"[Stage2] task_weight: power={args.task_weight_power}, "
+              f"weight range [{min(vals):.3f}, {max(vals):.3f}]")
+
+    # 编码 + 为每个 sample 打上 weight（class_weight × task_weight 相乘）
+    encoded = []
+    for r in rows:
+        enc = encode_sft(r, tokenizer, args.max_len, SYSTEM_PROMPT)
+        if len(enc["input_ids"]) > 0:
+            w = 1.0
+            # class_weight：仅对 (task, str label) 有效；dict/其它 label 跳过
+            label = r.get("label")
+            if isinstance(label, str):
+                w *= cw.get((r["task"], label), 1.0)
+            # task_weight：对所有任务生效
+            if tw:
+                w *= tw.get(r.get("task", ""), 1.0)
+            enc["weight"] = w
+            encoded.append(enc)
+    dataset = Dataset.from_list(encoded)
 
     train_args = TrainingArguments(
         output_dir=args.output_dir,
@@ -147,10 +361,16 @@ def main():
     # 【省显存】用 bitsandbytes 8bit AdamW，fp32 优化器状态 → 1B/参数，8B model 的 LoRA
     # 训练省 ~5GiB 优化器状态显存；不影响收敛。
     optimizer = build_lora_plus_optimizer(model, base_lr=args.lr)
-    trainer = Trainer(model=model, args=train_args, train_dataset=dataset,
-                      data_collator=DataCollatorForSeq2Seq(
-                          tokenizer, padding=True, label_pad_token_id=-100),
-                      optimizers=(optimizer, None))
+    # class_weight / task_weight 任一开启 → 用 WeightedSFTTrainer（per-sample weight）
+    use_weighted = args.use_class_weight or args.task_weight_power > 0
+    TrainerCls = WeightedSFTTrainer if use_weighted else Trainer
+    if use_weighted:
+        collator = WeightedSFTCollator(tokenizer, max_len=args.max_len)
+    else:
+        collator = DataCollatorForSeq2Seq(tokenizer, padding=True, label_pad_token_id=-100)
+    trainer = TrainerCls(model=model, args=train_args, train_dataset=dataset,
+                         data_collator=collator,
+                         optimizers=(optimizer, None))
     trainer.add_callback(ProgressCallback())
     if IS_MAIN:
         print("[Stage2] 开始训练 ...")

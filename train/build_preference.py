@@ -42,6 +42,7 @@ import json
 import sys
 import os
 import time
+import re
 
 import sklearn
 import torch
@@ -49,6 +50,39 @@ from peft import PeftModel
 
 sys.path.insert(0, __file__.rsplit("/", 1)[0])
 from common import SYSTEM_PROMPT, add_common_args, load_model_tokenizer, read_jsonl
+
+
+# ============================================================
+# Binary 任务集合（build_preference 加 <ans> 区分度过滤用）
+# ============================================================
+# 这些任务 label ∈ {positive, negative}，随机采样 50% 撞上 chosen 的标签；
+# 不加 <ans> 过滤则 DPO 损失 ≈ log2，对训练无信号。
+# regression / multiclass 任务天然区分度高，不需要这个过滤。
+BINARY_TASKS = frozenset({
+    "rna_protein_interaction",
+    "antibody_antigen",
+    "tf-h-0", "tf-h-1", "tf-h-2", "tf-h-3", "tf-h-4",
+    "tf-m-0", "tf-m-1", "tf-m-2", "tf-m-3", "tf-m-4",
+    "emp-H3", "emp-H3K4me1", "emp-H3K4me2", "emp-H3K4me3",
+    "emp-H3K9ac", "emp-H3K14ac", "emp-H3K36me3", "emp-H3K79me3",
+    "emp-H4", "emp-H4ac",
+    "pd-prom_300_all", "pd-prom_300_notata", "pd-prom_300_tata",
+    "cpd-prom_core_all", "cpd-prom_core_notata", "cpd-prom_core_tata",
+    "promoter_enhancer_interaction-K562", "promoter_enhancer_interaction-GM12878",
+    "promoter_enhancer_interaction-HeLa-S3", "promoter_enhancer_interaction-HUVEC",
+    "promoter_enhancer_interaction-IMR90", "promoter_enhancer_interaction-NHEK",
+})
+
+
+_ANS_RE = re.compile(r"<ans>\s*(.+?)\s*</ans>", re.IGNORECASE | re.DOTALL)
+
+
+def _extract_ans(s: str):
+    """从 <ans>...</ans> 块提取 label 字符串；无则返回 None。"""
+    if not isinstance(s, str):
+        return None
+    m = _ANS_RE.search(s)
+    return m.group(1).strip() if m else None
 
 
 def main():
@@ -243,7 +277,20 @@ def main():
                 if not rejected or rejected == chosen:
                     skipped += 1
                     continue
+                # 【P0-1】binary 任务进一步过滤：<ans> 标签相同的 pair 对 DPO 无信号
+                # 跳过这个过滤后，binary 任务每对的 loss ≈ log2（等效于白喂）。
+                # regression / multiclass 任务标签天然分布广，不需要这个过滤。
+                task = r.get("task", "")
+                if task in BINARY_TASKS:
+                    chosen_ans = _extract_ans(chosen)
+                    rejected_ans = _extract_ans(rejected)
+                    if chosen_ans is None or rejected_ans is None or chosen_ans == rejected_ans:
+                        skipped += 1
+                        continue
+                # 【P0-2】输出带 task / input 字段，便于后续按任务拆解 & 排查
                 f.write(json.dumps({
+                    "task": task,
+                    "input": r["input"],
                     "prompt": [{"role": "user", "content": r["input"]}],
                     "chosen": [{"role": "assistant", "content": chosen}],
                     "rejected": [{"role": "assistant", "content": rejected}],

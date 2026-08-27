@@ -12,6 +12,7 @@ from collections import defaultdict
 
 import numpy as np
 import pandas as pd
+import torch
 from scipy.stats import spearmanr, pearsonr
 from sklearn.metrics import (
     matthews_corrcoef, accuracy_score, r2_score, roc_auc_score,
@@ -320,7 +321,6 @@ def _to_binary(mods, classes):
 
 
 def process_Fmax_for_FunctionEC_task(task_name, task_entries, ec_labels):
-    import torch
     preds, labels = [], []
     proc = []
     for e in task_entries:
@@ -349,7 +349,6 @@ def process_Fmax_for_FunctionEC_task(task_name, task_entries, ec_labels):
 
 
 def _ec_to_multihot(ec_list, ec_labels):
-    import torch
     v = torch.zeros(len(ec_labels))
     if not ec_list: return v
     for ec in ec_list:
@@ -420,8 +419,13 @@ def compute_R2(label_values, result_values):
 
 
 def compute_mixed_score(label_values, result_values, threshold=30, max_value=1e3):
-    a = pd.to_numeric(result_values, errors='coerce').astype(float).values
-    b = pd.to_numeric(label_values, errors='coerce').astype(float).values
+    # pd.to_numeric 对 ndarray 输入会直接返回 ndarray（没有 .values 属性），
+    # 而 process_regression_task 返回的是 Python list，所以统一先转 list 再走 pandas。
+    # astype(float) 后仍可能返回 ndarray（不是 Series），因此不能用 .values / .to_numpy。
+    a_arr = pd.to_numeric(list(result_values), errors='coerce').astype(float)
+    b_arr = pd.to_numeric(list(label_values), errors='coerce').astype(float)
+    a = np.asarray(a_arr, dtype=float)
+    b = np.asarray(b_arr, dtype=float)
     inf_mask = np.abs(a) > max_value
     valid = ~inf_mask & np.isfinite(a) & np.isfinite(b)
     if valid.sum() == 0: return {"mixed_score": 0.0}
@@ -576,25 +580,28 @@ def main():
                 if task_name == "FunctionEC":
                     p, l = process_Fmax_for_FunctionEC_task(task_name, entries, ec_labels)
                     if p is not None:
-                        try: metrics[task_name] = {"Fmax": _count_f1_max(p, l)}
-                        except Exception as e:
-                            logger.error(f"Fmax error: {e}")
-                            metrics[task_name] = {"Fmax": 0.0}
+                        metrics[task_name] = {"Fmax": _count_f1_max(p, l)}
                     else:
                         metrics[task_name] = {"Fmax": 0.0}
                 elif task_name == "Modification":
                     y_true, y_pred = process_AUC_for_Modification_task(task_name, entries, MODIFICATION_CLASSES)
-                    try:
-                        metrics[task_name] = {"AUC": roc_auc_score(y_true, y_pred, average='macro', zero_division=0)}
-                    except Exception as e:
-                        logger.error(f"AUC error: {e}")
-                        metrics[task_name] = {"AUC": 0.0}
+                    # scikit-learn >=1.4 的 roc_auc_score 已移除 zero_division 参数；
+                    # 对于全 0 / 全 1 预测的退化情况，roc_auc_score 在 average='macro' 下
+                    # 仍可能抛 ValueError，这里捕获后记 0.0 保持与之前一致的行为。
+                    # 外层 try/except 已经覆盖 Exception + log；保持裸调用即可。
+                    metrics[task_name] = {"AUC": roc_auc_score(y_true, y_pred, average='macro')}
         except Exception as e:
             logger.exception(f"Task {task_name} failed")
             print(f"Task {task_name} FAILED: {e}")
             metrics[task_name] = {tmet: 0.0}
 
         v = metrics[task_name][tmet]
+        # sklearn 某些退化情况下（y_true 全 0 / 全 1）会返回 np.nan 而不是抛异常；
+        # 这里统一归零，避免下游消费方（json / csv / DataFrame）出现 NaN 污染。
+        if isinstance(v, float) and (v != v or v == float("inf") or v == float("-inf")):
+            logger.warning(f"[{task_name}] {tmet} returned non-finite value {v}, coerced to 0.0")
+            metrics[task_name][tmet] = 0.0
+            v = 0.0
         print(f"  -> {tmet} = {v}")
 
     # 不缩放，直接输出原始值（与 evaluate.py 兼容：evaluate.py 默认 ×100，
@@ -606,7 +613,12 @@ def main():
                 _maybe_scale(v, dp, sf)
             elif isinstance(v, (int,float,np.floating,np.integer)):
                 try:
-                    d[k] = float(round(float(v)*sf, dp))
+                    fv = float(v) * sf
+                    # NaN / Inf 统一归零，避免下游 json / csv 出现 NaN 污染
+                    if fv != fv or fv == float("inf") or fv == float("-inf"):
+                        d[k] = 0.0
+                    else:
+                        d[k] = round(fv, dp)
                 except Exception:
                     pass
     out = defaultdict(dict)
