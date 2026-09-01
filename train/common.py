@@ -231,7 +231,23 @@ def add_common_args(parser: argparse.ArgumentParser):
 
 
 def load_model_tokenizer(model_path: str, use_4bit: bool = True, max_len: int = 1024):
-    """加载 base 模型 + tokenizer。device_map 兼容单卡/多卡 DDP。"""
+    """加载 base 模型 + tokenizer。device_map 单/双卡同代码。
+
+    ============================================================================
+    【单/双卡同代码的关键】device_map = {"": int(os.environ.get("LOCAL_RANK", "0"))}
+    ============================================================================
+    本地单卡开发：没启动 torchrun，LOCAL_RANK=0，device_map={"": 0} → 装到卡 0。
+    Kaggle 双卡：torchrun 自动设 LOCAL_RANK=0/1，device_map={"": 0}/{"": 1}，
+                 各 rank 拿到不同卡。
+
+    这种"空字符串 key → 整数"语法是 transformers 特有的约定：空字符串不是
+    真实 module name，而是"整个模块"占位符；遇到嵌套 module 时，所有子
+    module 会被装到同一个 cuda:0/1 上（不走 layer-wise 分裂）。
+
+    【不做层间分割的原因】我们只够单卡装下 7B（4-bit + KV cache 到 几GiB）。
+    如果设 device_map="auto"，transformers 会自动跨卡分层，但走 NCCL 会比单卡
+    慢——80% of 训练时间花在卡间通信上。不值。
+    """
     tokenizer = AutoTokenizer.from_pretrained(model_path, trust_remote_code=True)
     if tokenizer.pad_token is None:
         tokenizer.pad_token = tokenizer.eos_token
@@ -253,9 +269,16 @@ def load_model_tokenizer(model_path: str, use_4bit: bool = True, max_len: int = 
             model_path, torch_dtype=torch.bfloat16,
             device_map=device_map, trust_remote_code=True)
     model.config.use_cache = False
-    # TP warnings 的真修在 setup_env()（把 modeling_utils.verify_tp_plan 替换为 no-op）——
-    # verify_tp_plan 是在 from_pretrained 加载期间被调用的，这里加载完才清 _tp_plan 已经晚了。
-    # 下面的清空保留作防御（后续若有其他路径读 _tp_plan 也不至于误判我们在做 TP）。
+    # ============================================================================
+    # _tp_plan 二次清空（防御层）
+    # ============================================================================
+    # 主修复点在 setup_env()：把 modeling_utils.verify_tp_plan 换成 lambda
+    # ——这是根因拦截。verify_tp_plan 是 transformers 在 from_pretrained **期间**
+    # 调用的，如果到加载后才清 _tp_plan，warning 已经在加载期打出。
+    #
+    # 这里的 setattr 是**防御层**，防止后续某个代码路径（如 PEFT 的 get_peft_model
+    # 检查是否要拆 LoRA 到多 TP rank）误读 _tp_plan 不为 None 的状态。如果出现
+    # 了 _tp_plan 残留的 bug，可以看到这里 catch。
     for attr in ("_tp_plan",):
         if hasattr(model, attr):
             setattr(model, attr, None)

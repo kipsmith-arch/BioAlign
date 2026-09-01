@@ -233,7 +233,25 @@ def run(args):
     speed_total = total / elapsed_total if elapsed_total > 0 else 0.0
     # 每样本延迟 = 整 batch wall time / batch_size
     sample_latency_ms = (elapsed_total * 1000.0) / total if total > 0 else 0.0
-    # latency p50/p95（基于 batch 维度除以 batch_size 估算）
+    # ============================================================================
+    # lat p50/p95/p99 计算 —— 【近似口径、需要谈结论是不能默认与vLLM 同维度】
+    # ============================================================================
+    # [近似设计] per_sample_latency = per_batch_latency_ms / batch_size。
+    #   HF generate 没有公开的 per-sample API，只能以 batch 为粒度报计时。
+    #   隐含假设：batch 内样本长度一致。实际均匀，但顺序敏感序列长度差异 2x
+    #   会带来-20% 偏。需在报告里谈。
+    #
+    # [p95/p99 索引算法]
+    #   sorted_lat = sorted(per_sample_latency)
+    #   p95_idx = max(0, int(N * 0.95) - 1)
+    #   p99_idx = max(0, int(N * 0.99) - 1)
+    #   取 max(0, ...) 是防御 N=1 时 int(0.95)-1=-1 添 OOB。
+    #
+    # [为什么 vLLM 路径不报 p50/p95/p99]
+    #   vLLM 采 continuous batching，per-request latency 不是稳定公开 API。
+    #   0.6.x 里 out.metrics 字段名跨版本飘。bench.py fast_infer.json 里 p*
+    #   全置 None（vLLM 路径不报 lat），只走 throughput 为主对比。
+    # ============================================================================
     if per_batch_latency_ms:
         per_sample_latency = [x / batch_size for x in per_batch_latency_ms]
         p50 = statistics.median(per_sample_latency)

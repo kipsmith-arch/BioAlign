@@ -191,7 +191,16 @@ class WeightedSFTCollator:
 
 
 class WeightedSFTTrainer(Trainer):
-    """自定义 Trainer：实现 per-sample 加权 loss。"""
+    """自定义 Trainer：实现 per-sample 加权 loss。
+
+    设计概要：
+    - Stage 2 任务间样本量严重不均（7.8×是参考）。论文推荐用 sample weight
+      修正：weight[task] ∝ max_count / count[task]^power，power=0.5。
+    - 因为 task prefix 是文本注入而非独立 embedding，决定了不能用 logits mask
+      做 "task 平衡采样"——只能用 loss function 加权。
+    - 为了让 weight**不退化损失量级**，采归一化到 mean(w) = 1 的策略：全 1 weight
+      时严格退化为标准 token-CE（在 token 数相同时）。
+    """
 
     def compute_loss(self, model, inputs, return_outputs=False, **kwargs):
         weights = inputs.pop("weight", None)
@@ -199,14 +208,26 @@ class WeightedSFTTrainer(Trainer):
         outputs = model(**inputs)
         logits = outputs.logits
         if weights is None:
+            # 未启用 task weights 时的标准 CE 路径——走 cross_entropy 的
+            # 默认 reduction="mean"，等价于在所有非 -100 token 上取平均。
             loss = torch.nn.functional.cross_entropy(
                 logits.view(-1, logits.size(-1)),
                 labels.view(-1),
                 ignore_index=-100,
             )
         else:
-            # per-token CE → per-sample 平均（跳过 -100）→ 用 per-sample weight 加权平均。
-            # 归一化到 mean(weight)=1：weight 全 1 时严格退化为标准 CE（与 ignore_index 一致）。
+            # ============================================================================
+            # per-sample 加权 loss 三阶段流程
+            # ============================================================================
+            # [Stage A] per-token CE，reduction="none" 跳出默认的 mean 归约；
+            #           形状 (B, T)，保留每个 (b, t) 的独立 CE 值。
+            # [Stage B] per-sample 平均：在每个 b 上把 loss × (labels != -100) 抹
+            #           掉 padding / 不了 token 位置，再对 t 求和 / token_cnt。
+            #           得到 (B,) 的 per_sample loss  —— 与 batch 里 token 数
+            #           不同无关，完全对齐"一个样本一个 loss”的语义。
+            # [Stage C] per-sample weight 加权：太鲁棒太鲁棒的 mean(weight)=1
+            #           归一化是为了严格退回为 mean(per_sample)，与未加权时
+            #           同量级。
             losses = torch.nn.functional.cross_entropy(
                 logits.view(-1, logits.size(-1)),
                 labels.view(-1),

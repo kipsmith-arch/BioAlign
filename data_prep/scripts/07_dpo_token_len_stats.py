@@ -40,6 +40,9 @@ from transformers import AutoTokenizer
 # ===== 与 train/common.py 第 34 行 SYSTEM_PROMPT 逐字一致 =====
 # 不要在这里 from common import —— common.py 顶层 import torch/peft/transformers/sklearn，
 # 会无谓拖慢启动并污染环境。下面是字面值拷贝，stage3_dpo.py 用的就是这一份。
+# 【脆弱耦合声明】双向：本变 train/common.py 也只許改这里。
+# 这里是唯一不可避免的字面副本，因为 apply_chat_template 要求 system 消息**字节
+# 级相同**才能产生与训练一致的 token 序列；token 长度差 1 个就会让所有分位数推算失效。
 SYSTEM_PROMPT = (
     "You are a knowledgeable and helpful biology assistant. "
     "Please answer my biology sequence-related questions clearly and concisely. "
@@ -59,8 +62,23 @@ def stat(name, lens):
 
 
 def encode_len(pair, tokenizer, max_len, system_prompt):
-    """与 stage3_dpo.py::encode_pair._enc 完全一致的 token 计数。
-    返回 (chosen_total_len, rejected_total_len, prompt_len)"""
+    """复刻 stage3_dpo.py::encode_pair._enc，返回 (chosen_total, rejected_total, prompt_len)。
+
+    关键点【与训练代码严格一致】：
+      1) apply_chat_template**调用两次**：
+         - full_text  = msgs, add_generation_prompt=False   包含 assistant 回答
+         - prompt_text = msgs[:-1], add_generation_prompt=True   只到 assistant 起点
+         → 两者的差就是 prompt 偏移量，记为 n_prompt。
+      2) 截断顺序：
+         - 训练时传 max_length=max_len, truncation=False 给 tokenizer.encode（同这里）；
+         - Python 端再 `ids_full[:max_len]` 切账。
+         【为什么不全交给 tokenizer 截断】tokenizer 可能在中间不同位置 truncate
+         （DefaultStrategy 是尾部，但 Qwen 2.5 chat_template 可能不同）；手动
+         末尾截断与训练端字节级一致是唯一安全选项。
+      3) `n_prompt = min(len(ids_prompt), len(ids_full))`：
+         防 prompt 越长过 full（不会），但 corner case 是 "add_generation_prompt=True"
+         比 "False" 多<|im_start|>assistant\n" 几个 token·差 1 不是问题，但是防御性的。
+    """
     def _enc(content):
         msgs = [
             {"role": "system", "content": system_prompt},
@@ -134,6 +152,11 @@ def main():
     stat("prompt_len", prompt_lens)
     stat("chosen_total", chosen_totals)
     stat("rejected_total", rejected_totals)
+    # batch_max = max(chosen_total, rejected_total)
+    # 为什么是 batch_max 而不是 chosen_total：stage3 训练里 collator 会把
+    # chosen 和 rejected 两个序列一起 pad 到“整个 batch 里的最长”，中间任意一个
+    # micro-step 的 logits / grad 张量 实际是按 max(chosen, rejected) 分配的。
+    # 如果你只在 chosen 上看 0.9% 截断率，会低估所须的 max_len。
     stat("batch_max", batch_maxes)
     print(f"\n  截断率（>= {max_len_cap}）: "
           f"{n_truncated}/{n_total} = {n_truncated / max(n_total, 1) * 100:.2f}%\n")
@@ -150,6 +173,22 @@ def main():
     print("  policy bf16 logits = 2B·T·V·2B；ref 同尺寸（inference_mode 不建图但占用 alloc）")
     print("  + lm_head fp32 grad = 2B·T·V·4B  ← 反向时炸显存的真凶")
     print()
+    # ============================================================================
+    # 【粗估公式与数字说明】
+    # ============================================================================
+    # 这是一份"反向峰值"的项式提据，不是精确推算。要点：
+    # 1) logits 张量 (2B, T, V) bf16 占用 = 2·B·T·V·2 字节 —— forward 时临时缓存，
+    #    backward 后释放。但 chunked log_softmax 会同时存 logits·logsumexp 2 份，
+    #    这里都简化为 1 份。
+    # 2) lm_head 的 fp32 gradient (2B, T, V) = 2·B·T·V·4 字节 —— 这是反向时真的
+    #    挥不掉的部分（在 chunk_token_logp.gather 反传里出现），是 DPO 4-bit 在长
+    #    序列上炸显存的**真凶**。种 token_logprobs 里的 chunk 合并是为了让该张量
+    #    在 chunk-size=4096 边界内能装下。
+    # 3) V=152064 是 Qwen2.5-7B 的词表大小。另外训练时 grad_accum > 1 会在 N
+    #    个 micro-step 里不 all-reduce 各级 grad。这里估的是**单步峰值**，不是
+    #    总占用。
+    # 4) 实际峰值还要加：base model 14GB、KV cache、optimizer state。表中的数字
+    #    是 *增量*。
     for thr in [768, 1024]:
         for B in [2, 4]:
             T = thr

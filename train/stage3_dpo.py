@@ -77,36 +77,163 @@ def encode_pair(pair, tokenizer, max_len, system_prompt):
 
 
 def token_logprobs(logits, input_ids, labels, pad_token_id, chunk_size=4096):
-    """对每个非 -100 位置计算 log P(token)，返回 (总对数概率, 有效 token 数)。
+    """对每个"有效 token 位置"算模型给出的 log P(target_token)，按样本求和，返回
+    (每个样本的 log-prob 标量, 每个样本的有效 token 数)。
 
-    【A100-40GB 优化 v2】
-    1. logsumexp_full 用 bf16 计算：原代码 logits.float() 产生 ~3.5 GB fp32 临时。
-       改为 logsumexp(bf16_logits).float()，临时张量仅 ~0.9 GB bf16。
-       bf16 logsumexp 数值差异 < 1e-3，相对于 DPO Δ (β·log_ratio, 量级 0.01-1.0) 可忽略。
-    2. chunk_size=4096：循环从 300 次降到 37 次，减少 Python 端开销。
-       bf16 chunk 临时张量 (B=2, T=767, 4096) ≈ 12 MB，安全。
-    3. chunk 内用 bf16 减法，末尾 .float() 校正——保留跨 chunk 累加的 fp32 精度。
+    ============================================================================
+    这不是 softmax 的替代 —— 它就是 softmax + 取 log + 按位置 gather 出来的对数
+    概率。下面把每个变量先讲清楚。
+
+    --------------------------------------------------------------------------
+    输入张量的几何形状与含义
+    --------------------------------------------------------------------------
+    logits       : (B, T, V)   模型的原始输出（未归一化的分数）。
+                              B = batch, T = 序列长度, V = 词表大小。
+                              这里沿用 LM 的"自回归"约定：
+                                logits[:, t, :] 是用来预测"位置 t+1 该是什么 token" 的分数。
+                              所以 logits 的"预测对象"是 input_ids 右移一格。
+
+    input_ids    : (B, T)      token 化后的输入序列。
+                              input_ids[:, t] 才是被 logits[:, t, :] 预测的目标。
+                              这就解释了下面为什么会再切 [:, 1:] 做 targets —— 见下行。
+
+    labels       : (B, T)      与 input_ids 同形状，但等于 -100 的位置代表
+                              "不算 loss"（HuggingFace Trainer / CrossEntropyLoss
+                              的约定：ignore_index = -100）。
+                              通常 padding 位置 + 用户主动 mask 掉的位置都是 -100。
+
+    pad_token_id : int         pad token 的 id，用来二次过滤"虽然 label != -100，
+                              但原本的位置上是 pad" 的样本对（防御性）。
+
+    --------------------------------------------------------------------------
+    为什么 targets / labels 都切 [:, 1:]？
+    --------------------------------------------------------------------------
+    因为 logits[:, t, :] 预测的是 input_ids[:, t+1]。所以真正"被预测的位置"是
+    1..T-1。我们把"被预测的 ground-truth token id"提到一维张量里方便操作：
+
+        input_ids[:, 1:]  : 每个位置 (b, t) 的 t' = t+1 位置的真实 token id
+                            —— 这就是我们要算 log P(token) 的那个 token，即
+                               targets[b, t] = input_ids[b, t+1].
+        labels  [:, 1:]   : 同样右移一位，使得 labels[b, t] 与 targets[b, t] 在
+                            同一格对齐，labels[b, t] == -100 表示"这一格的
+                            target 不参与 loss"。
+
+    切完之后所有张量都变成 (B, T-1)，三维 logits 也要相应地丢掉最后一帧时间步：
+    logits[:, :-1, :] 形状是 (B, T-1, V)，与 targets/labels 时间维对齐。
+
+    --------------------------------------------------------------------------
+    核心数学
+    --------------------------------------------------------------------------
+    对每个 (b, t)，我们要算：
+
+        log P ( targets[b, t] | 历史 = input_ids[b, :t+1] )
+        = logits[b, t, targets[b, t]]  -  logsumexp_v ( logits[b, t, :V] )
+        =  u(b,t,target)               -  Z(b,t)
+
+    其中 Z(b,t) = log Σ_v exp( logits[b, t, v] ) 是 softmax 的归一化常数（取对数）。
+    第一项是直接按 targets[b,t] 这个下标去 logits 里"取数"，第二项是"全词表和"。
+
+    总输出：对每个样本 b 把所有非 mask 位置的 log P 对 t 求和 → total[b]。
+
+    ============================================================================
     """
-    targets = input_ids[:, 1:]                    # (B, T-1)
-    labels = labels[:, 1:]                        # (B, T-1)
-    mask = (labels != -100) & (targets != pad_token_id)
-    count = mask.sum(dim=-1).clamp(min=1)
-    # 【显存优化】bf16 算 logsumexp，输出 .float()。省 ~3.5 GB 临时张量。
-    logsumexp_full = torch.logsumexp(logits[:, :-1, :], dim=-1).float()  # (B, T-1) fp32
-    total = torch.zeros(targets.size(0), dtype=torch.float32, device=logits.device)
-    V = logits.size(-1)
+
+    # --------------------------------------------------------------------------
+    # 步骤 1：对齐时间维
+    # --------------------------------------------------------------------------
+    # 把"被预测的真值"沿时间轴挪到与预测 logits 同长度：
+    #   targets[b, t]  ==  input_ids[b, t+1]   (我们要去算 log P 的那个 token)
+    #   labels  [b, t]  ==  labels  [b, t+1]   (同步右移，便于对齐判断)
+    targets = input_ids[:, 1:]                    # (B, T-1)  int64, 真值 token id
+    labels  = labels  [:, 1:]                     # (B, T-1)  int64, -100 视为忽略
+
+    # --------------------------------------------------------------------------
+    # 步骤 2：构造有效位置 mask
+    # --------------------------------------------------------------------------
+    # mask[b, t] = True 当且仅当"这一格真的要被算进 log-prob 总和"。
+    #   - labels  != -100  : 用户/tokenizer 没把这一格标记成"不算 loss"。
+    #   - targets != pad   : 防御性，避免对 pad 位置算非零概率（理论上 padding
+    #     的 label 已经是 -100，但保险起见再加一层）。
+    mask = (labels != -100) & (targets != pad_token_id)   # (B, T-1)  bool
+
+    # 有效 token 数。clamp(min=1) 是防止后续用 count 做分母时除 0（虽然 mask.sum
+    # 至少为 0，所以这里把 0 钳成 1，避免下游 NaN）。
+    count = mask.sum(dim=-1).clamp(min=1)                 # (B,)        int64
+
+    # --------------------------------------------------------------------------
+    # 步骤 3：算"全词表归一化常数" Z(b, t) = logsumexp(logits, dim=-1)
+    # --------------------------------------------------------------------------
+    # 【显存优化关键点 1】
+    # 不先 .float()，而是直接对 bf16 logits 调 torch.logsumexp，再把结果转 fp32。
+    # 这样 kernel 在 bf16 下完成所有归约，临时张量从 ~3.5 GB(fp32) 降到 ~0.9 GB(bf16)。
+    # 形状 (B, T-1)，沿 V 维归约后 V 那一维被吞掉，只剩"每个位置的归一化常数"。
+    # 输出 .float() 转成 fp32 是为了后面加减 / 累加时数值稳。
+    logsumexp_full = torch.logsumexp(
+        logits[:, :-1, :], dim=-1
+    ).float()                                            # (B, T-1)      fp32
+
+    # --------------------------------------------------------------------------
+    # 步骤 4：初始化 fp32 累加器
+    # --------------------------------------------------------------------------
+    # 最后输出的"每个样本总 log-prob"是标量 (B,)。这里先建一个 fp32 零向量，
+    # 因为后续要累加"乘过 mask 的逐位置 log-prob"到这上面，fp32 累加可避免跨
+    # 多次 bf16 运算时的精度漂移。
+    total = torch.zeros(
+        targets.size(0), dtype=torch.float32, device=logits.device
+    )                                                    # (B,)           fp32
+
+    V = logits.size(-1)                                  # 词表大小
+    # --------------------------------------------------------------------------
+    # 步骤 5：沿 V 维分块（避免构造 (B, T-1, V) 的全词表 log-prob 表）
+    # --------------------------------------------------------------------------
+    # 朴素做法是 log_probs = logits[:, :-1, :] - logsumexp_full.unsqueeze(-1)，
+    # 得到一个 (B, T-1, V) 的 bf16 表，B=2 T=768 V=32000 时大约 19 GB，炸显存。
+    # 这里改成沿 V 分块 (chunk_size=4096)：每次只看 V 维的一小段，把这一段对应
+    # 位置上"target 落在该段"的那个数累加进 total。其余位置这一轮不贡献。
     for v_start in range(0, V, chunk_size):
-        v_end = min(v_start + chunk_size, V)
-        chunk_logits = logits[:, :-1, v_start:v_end]  # (B, T-1, chunk_size) bf16
-        chunk_logp = chunk_logits - logsumexp_full.unsqueeze(-1)  # bf16 减法
-        # gather: target 不在 chunk 时 clamp 到 chunk 边界，mask 保证不污染
-        safe_targets = targets.clamp(min=v_start, max=v_end - 1) - v_start
+        v_end   = min(v_start + chunk_size, V)
+
+        # 这一小块原始分数 (B, T-1, chunk_size)，bf16，没升 fp32。
+        chunk_logits = logits[:, :-1, v_start:v_end]             # (B, T-1, chunk)  bf16
+
+        # 把这一小段的"非归一化分数"减去对应位置的 Z(b, t)，得到这一段的 log
+        # P。broadcast：logsumexp_full[:, :, None] - chunk_logits，bf16 减法。
+        # 数值上等价于"只对这一小段做 softmax + log"，但只在 V 的一小段上做。
+        chunk_logp = chunk_logits - logsumexp_full.unsqueeze(-1) # (B, T-1, chunk)  bf16
+
+        # 我们要从 chunk_logp 里取出"targets[b,t] 这一列"那一格。
+        # 但 targets[b, t] 不一定落在这块 [v_start, v_end) 内：
+        #   - 落在块内 → 直接取
+        #   - 落在块外 → 这次循环不取，但下面的 in_range mask 会把这一格屏蔽掉，
+        #                等下一块循环时再由对应的 v_start 命中
+        # 为了让 torch.gather 不越界访问，我们先 clamp 到 [v_start, v_end-1]，
+        # 再减去 v_start 得到"块内局部索引"。被 clamp 命中的那一格之后会被
+        # (mask & in_range) 屏蔽掉，所以 clamp 只是为了让 gather 安全跑通。
+        safe_targets = targets.clamp(min=v_start, max=v_end - 1) - v_start  # (B, T-1) int64
+
+        # gather：按 safe_targets 在最后一维取数，得到 (B, T-1, 1) 然后 squeeze。
         chunk_token_logp = torch.gather(
-            chunk_logp, -1, safe_targets.unsqueeze(-1)).squeeze(-1)  # (B, T-1)
-        in_range = (targets >= v_start) & (targets < v_end)
+            chunk_logp, -1, safe_targets.unsqueeze(-1)
+        ).squeeze(-1)                                               # (B, T-1)  bf16
+
+        # 判定"targets[b,t] 真落在这块"的样本：
+        in_range = (targets >= v_start) & (targets < v_end)          # (B, T-1)  bool
+
+        # 累加：
+        #   - chunk_token_logp.float()        ：升 fp32，跨块累加保精度
+        #   - (mask & in_range).float()       ：只有"应当算 + 真落在这块"两条件都
+        #                                       满足的位置贡献 1.0，其余 0.0
+        #   - .sum(dim=-1)                   ：对每个样本 b 把所有 t 上的贡献加和
+        #   - +=                            ：累加进 total[b]（fp32 标量）
         total += (chunk_token_logp.float() * (mask & in_range).float()).sum(dim=-1)
+
+        # 立即释放这一块的 bf16 临时张量，避免下次循环再占一份显存。
         del chunk_logits, chunk_logp, chunk_token_logp
+
+    # logsumexp_full 不再用了，释放。
     del logsumexp_full
+
+    # 返回：每个样本的总对数概率 (B,) 和有效 token 数 (B,)
     return total, count
 
 

@@ -176,7 +176,37 @@ _UNK_PAT = re.compile("|".join(UNKNOWN), re.IGNORECASE)
 
 
 def _score_binary(text: str) -> Tuple[int, float, str]:
-    """返回 (pred_label 0/1, confidence 0~1, matched_rule)"""
+    """逐文本抽取二分类预测，返回 (pred_label 0/1, confidence 0~1, matched_rule)。
+
+    ============================================================================
+    多阶段判定逻辑 (按顺序):
+    ============================================================================
+      [Stage 1] 结构化字段优先
+        - 提取 <ans>...</ans> 或 "Answer: xxx"
+        - 短文本 ("yes"/"positive"/...) 直接判→ conf 1.0
+        - 多句文本 → 用字段内容当 text 继续走 stage 2
+
+      [Stage 2] head 里判 unknown (犹疑型语言)
+        - head 里有犹疑词 （"don't know" 等）且无明确信号 → return None
+        - 有犹疑词且也有 pos/neg → 走 stage 3 作为"犹疑后补判"
+
+      [Stage 3] head 里比较先后出现位置
+        - 取 "yes" 出现位置 pos_pos, negative 最早出现位置 neg_pos
+        - pos 出现 > neg 出现 → 返回 negative （但 conf 调到 0.7，意为"犹豫后的反转"）
+        - pos 出现 = neg 出现 或 只命中一个 → 采用那一个
+
+      [Stage 4] 退到全文：按首次出现的强信号判（conf 6.0/5.5）。
+        两个都有仍以出现先后作 tie-break
+
+      [Stage 5] 什么都没找到 → None, "no_signal"
+
+    【置信度梯度】1.0 (struct) > 0.9 (head) > 0.7 (犹豫反转) > 0.6 (body) > 0.55 (body tie)
+    使用场景：evaluate_v2.py 可以用 conf 来决定是否计入 final metric （未实现）。
+
+    【为什么 "yes" 用 raw.find 而不是 regex】:  STRONG_POSITIVE 里包含 "\byes[,.\s]"
+    要词界。faill_matcher 里走 STRONG_NEGATIVE 在前面取反；这里走 raw.find
+    适用于 raw equal 'yes' 这种高频词。
+    """
     if not text or not text.strip():
         return None, 0.0, "empty"
     # 优先从结构化字段提取
@@ -220,6 +250,9 @@ def _score_binary(text: str) -> Tuple[int, float, str]:
         # 特殊：head 里有"yes"但也有 negative 关键词（如"yes, but no binding"）
         # 此时看 negative 出现位置是否在 positive 之后
         if pos_pos >= 0 and neg_pos > pos_pos:
+            # 例："Yes, but the data suggests no interaction" →
+            # 第一句肯定，但后面被否定表态覆盖了。以负表态为主，
+            # conf 0.7（低于 0.9 的肯定主表态）是一种"异常反转"信号。
             return 0, 0.7, "negative_after_yes"
         return 0, 0.9, "negative_head"
 

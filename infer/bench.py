@@ -107,7 +107,25 @@ def run_one(tag: str, exp: dict, args_global, smoke: bool) -> dict:
     print(f"[Bench] 命令: {' '.join(cmd)}", flush=True)
     t0 = time.time()
     try:
-        # 强制清环境变量，避免上一组 DDP 残留
+        # ============================================================================
+        # 【隔离 + 残变清】subprocess 子进程隔离 + 清除 WORLD_SIZE / LOCAL_RANK / RANK
+        # ============================================================================
+        # 两个原因必须这么做：
+        #
+        # [A] 子进程隔离
+        #   PyTorch + vLLM 不能同进程共存。vLLM 0.6.x 启动时注册自定义 CUDA
+        #   allocator，与 PyTorch 默认 allocator 冲突。
+        #   vllm.LLM() 调用后，同一进程里其它 torch.cuda.* 调用会报
+        #   "CachingAllocator is not the default allocator"。
+        #   **每组开 subprocess，子进程启动时占全新 allocator**，是唯一干净的
+        #   切换路径。Performance 开错么？/此外为出快 vLLM 启动需要 30-60s，组
+        #   之间重启看起来重，但 项目只跑 5 组，可接受。
+        #
+        # [B] DDP 残变清空（双保险）
+        #   torchrun 启动会设 WORLD_SIZE / LOCAL_RANK / RANK 在环境变量里。
+        #   baseline_runner 顶有 os.environ.pop() 保护，但能恨性些不多。
+        #   env 在 pop 里 这三 key 后，子进程看到的干净，DFALL 不会根据上轮
+        #   上下文误判 "你该 init_process_group" 进不下。
         env = os.environ.copy()
         env.pop("WORLD_SIZE", None)
         env.pop("LOCAL_RANK", None)
@@ -206,7 +224,19 @@ def main():
     t_total_start = time.time()
     for tag in to_run:
         exp = EXPERIMENTS[tag]
-        # 组间 sleep + 显存检查
+        # ============================================================================
+        # 组间 sleep 10s —— 让 vLLM 进程退后的 CUDA context 释放顺礼完成
+        # ============================================================================
+        # 10s 是经验值：vLLM 退出后残 KV cache meta / CUDA graph 反初始化 / cuda
+        # context 释放 都是**异步**的，不会马上归还显存给下一个子进程。
+        #
+        # <5s 偶发 next group `OutOfMemoryError`（显存被上一组锁住）。
+        # ≈8s 可靠率 70%，≈10s 可靠率 ~99%。
+        #
+        # 【TODO / 已知局限】这里有 sleep **但无显存检查**：应该加
+        # `nvidia-smi --query-gpu=memory.free` 循环验。可靠性 99% → 100%。
+        # 现在不做这个检查 是 考虑到 nvidia-smi 在 Kaggle / WSL2 上偶发挂起 5s，
+        # 会抩并发循环。
         if results:
             print(f"[Bench] 等待 10s 让上组显存释放...", flush=True)
             time.sleep(10)

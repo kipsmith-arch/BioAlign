@@ -50,6 +50,17 @@ def main():
 
     # 模拟 SFT 的 ChatML 模板（与 stage2_sft.encode_sft 一致）
     def sft_encode_len(input_text, output_text):
+        """复刻 stage2_sft.encode_sft 的 ChatML 包裹，返回 (full_len, output_len)。
+
+        为什么两次 apply_chat_template：
+          - add_generation_prompt=False → 包含 assistant 完整消息 "full"；
+          - add_generation_prompt=True  → 只到 "<|im_start|>assistant\\n" 处 "prompt"；
+          - output_len = full - prompt = assistant 这部分的 token 数（近似，会
+            受 `prompt_text` 末尾 `<|im_start|>assistant\n` 几个 token 差影响）。
+
+        输出是 token **数**，不是 bytes；采样权重要点是：你那边看到的 SFT total
+        是 "包含 ChatML 模板 + input + output" 的总长。max_len 调践时用 total。
+        """
         msgs_full = [
             {"role": "system", "content": SYSTEM_PROMPT},
             {"role": "user", "content": input_text},
@@ -73,7 +84,21 @@ def main():
             total, out = sft_encode_len(d["input"], d["output"])
             sft_total.append(total)
             sft_output.append(out)
-            # DPO 模拟：prompt + chosen/output；prompt + rejected（这里都用 output 当 rejected 上界）
+            # ============================================================================
+            # DPO 模拟 —— 这里是 7B build_preference **之前**用的上界
+            # ============================================================================
+            # chosen = output（生成的高质量答案）
+            # rejected = output（**同样** output 作为上界）
+            #
+            # 【为什么是上界】
+            #   实际 DPO pair 里 chosen 与 rejected 是两个不同答案（rejected 是被
+            #   偏好的反例）；distinct rejected 通常与 chosen 长度接近但是偏长一点。
+            #   本脚本在 build_preference 运行之前写，手上只有 chosen 字段，所以
+            #   保守地拒绝 rejected_total = chosen_total —— 能估出**不会被截的样本**。
+            #
+            #   当 build_preference 产出后，应运行 07_dpo_token_len_stats.py，它
+            #   才有真实 chosen/rejected 分组统计。
+            # ============================================================================
             dpo_chosen_total.append(total)
             dpo_rejected_total.append(total)  # rejected 上界（同 prompt + 同长度答案）
             n += 1

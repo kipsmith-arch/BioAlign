@@ -38,7 +38,19 @@ sys.stdout.reconfigure(encoding='utf-8')
 
 INPUT_DIR = Path('../../input_data')
 
-# 多分类标签集合（按长度倒序，避免子串误匹配）
+# ============================================================================
+# 多分类标签集合（按长度倒序）—— 避免子串误匹配
+# ============================================================================
+# 为什么倒序：
+#   RNA_CLASSES 里 '5S_rRNA' 是 '5_8S_rRNA' 的子串。
+#   如果用 in / re.search 不加边界，会把 '5_8S_rRNA' 误判为 '5S_rRNA'。
+#   sorted(..., key=len, reverse=True) 后**检查顺序**先长后短：
+#   '5_8S_rRNA' (8字符) 先匹配，命中即返回，'5S_rRNA' 永远不会被误匹配。
+#
+# 其它 label_kind（如 mod）按相同思路保证 'm6Am' / 'm6A' 等不互相误匹配。
+#
+# 数据耦合：这些集合与 eval/parser_v2.py 的 RNA_CLASSES / MODIFICATION_CLASSES
+# 严格同步；改这边时要同步另一边。
 RNA_CLASSES = sorted([
     '5S_rRNA', '5_8S_rRNA', 'tRNA', 'ribozyme', 'CD-box', 'miRNA',
     'Intron_gpI', 'Intron_gpII', 'HACA-box', 'riboswitch', 'IRES',
@@ -62,7 +74,24 @@ REGRESSION_RANGES = {
 
 
 def label_kind(label, task):
-    """判断 label 的类型"""
+    """label 类型分发 —— 整段格式转换的 dispatch 中心。
+
+    返回以下 kind：
+      'dict'        多值回归（label 是 dict，如 {"hk": ..., "dev": ...}）
+      'class'       二分类字符串 positive/negative
+      'rna_family'  RNA 多分类标签（CD-box, IRES, leader 等）
+      'mod'         单个 RNA modification（m6A, m5C, ...)
+      'ec'          EC 号（"EC" 前缀 + 4 段数字 + 可选 '-' 占位）
+      'mod_multi'   多个 modification 用逗号分隔
+      'num'         数值（int / float 可转）
+      'other_str'   其它字符串（目前未用，保留）
+      'other'       兜底
+
+    EC 正则 `^EC\\d+\\.\\d+\\.\\d+\\.\\-?\\d*$` 设计点：
+      - 必须以 "EC" 开头；
+      - 3 个 "\." 分隔的数字段；
+      - 第 4 段 "\-?\d*"：可空可负（占位号是 "-" 如 EC2.4.1.-）。
+    """
     if isinstance(label, dict):
         return 'dict'
     if isinstance(label, str):
@@ -87,12 +116,22 @@ def label_kind(label, task):
 
 
 def compress_reason(original_output: str, max_sentences: int = 2) -> str:
-    """把训练数据原始 output 压缩成 1~3 句 reason。
-    策略：保留第一个句号前的内容 + 第一个句号后的第一句。"""
+    """压缩原始自然语言 output 为 1~max_sentences 句。
+
+    切句正则 `r'(?<=[.!?])\\s+'`：用 **lookbehind**（向后视），匹配"在
+    句末标点之后的空白处"切句。
+    - 用 lookbehind 而非简单 split：避免标点被切走（"Hello." 切成 ["Hello"]
+      而不是 ["Hello", "."]）；
+    - 不切中文句号"。" —— 数据是英文。
+
+    corner case：
+    - \"\" / None → 返回 ''；
+    - 无标点的长字符串 → 整个作为 1 句返回（即使 > 200 字符）；
+    - max_sentences 默认 2 是行为上限，调大可放更长；2 是当前配置。
+    """
     if not original_output:
         return ''
     text = original_output.strip()
-    # 切句
     sentences = re.split(r'(?<=[.!?])\s+', text)
     keep = []
     for s in sentences:
@@ -105,7 +144,21 @@ def compress_reason(original_output: str, max_sentences: int = 2) -> str:
 
 
 def format_answer(label, task) -> str:
-    """根据 label 类型返回 ANS 内的字符串"""
+    """根据 label 类型返回 <ans> 标签内的字符串。
+
+    数值分支（'num'）的关键设计：用 `f'{v:g}'` —— Python 自动选"最短表示"
+    保留有效数字同时去掉无意义的尾零：
+      - 0.1200000001 → 0.12（不会出现 0.1200000001 这种浮点噪声进 prompt）
+      - 51.09       → 51.09（精度保留）
+      - 1000000.0   → 1e+06（科学计数法兜底）
+      - 0.0         → 0
+      - 整数且 |v| 极小 < 1e-3 或 >= 1：直接 str 出来（如 51、-0.5）
+      - 整数但落入 (1e-3, 1) 区间（如 0.5 是 1/2）：保留 2 位小数避免信息损失
+        （防御性，多数情况下走 :g 已足够）
+
+    多值回归（'dict'）分支：每项独立格式化用同一种 :g，
+    保证 'hk=0.12, dev=0.34' 风格统一，与 stage2/fast_infer 输出格式对齐。
+    """
     kind = label_kind(label, task)
     if kind == 'class':
         return label.strip().lower()
@@ -137,7 +190,15 @@ def format_answer(label, task) -> str:
 
 
 def convert_record(r: dict) -> dict:
-    """转换一条训练样本"""
+    """转换单条训练样本：把 output 字段从自然语言描述换成结构化。
+
+    关键设计：
+    - 用 `{**r, 'output': new_output}` 而非显式列字段名：
+      未来新增字段（如 'metadata'、'source_url'）不需要改本函数，避免后
+      人加了字段被这里默默丢。
+    - 输出格式里换行符 `\n` 必须保留：parser_v2 的 `extract_ans_block`
+      用 `<ans>\s*(.+?)\s*</ans>` 的 DOTALL 模式依赖换行对齐。
+    """
     task = r['task']
     label = r['label']
     original_output = r.get('output', '')

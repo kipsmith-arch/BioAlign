@@ -153,6 +153,25 @@ def process_regression_task(task_name, task_entries, value_range=None):
 
 
 def process_binary_classification_task(task_name, task_entries):
+    """
+    与 evaluate.py 的兼容函数（同样 task 名）—— 但拨动 parse 与 类错路不同。
+
+    ============================================================================
+    【v1 vs v2 区别】
+    ============================================================================
+    v1 (old_classify_by_keywords)  : 只能在 yes/no/positive/negative 关键词上报。
+                                       'too uncertain' / 无提取出来 → fall back 是 0
+                                       (意味 negative)。这会造成：
+                                         -MCC 被人为压低 (都项趋同于 negative) ，
+                                          “deliberate 谨慎” 被 定为 错。
+    v2 (parse_binary_classification)  :         parse 为 None → result = 1 - label_class
+                                       。与 v1  反过来：取反（不让 0 class 占多)。
+                                       与 v1 反过来能恢复“binary judge
+                                       需要报样本”的业务表达。
+
+    【调 --use_old_parser 后退 为 v1 语义】
+    唯一是 复现 v1 指标用于 横向比较。
+    """
     label_classes, result_classes = [], []
     task_processed_data = []
     for entry in task_entries:

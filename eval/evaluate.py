@@ -235,6 +235,31 @@ def compute_R2(label_values, result_values):
         "R2": final_R2_score
     }
 
+# ============================================================================
+# 自定义混合指标 mixed_score —— siRNA efficiency 特例
+# ============================================================================
+# 与 compute_spearman / compute_R2 不同，mixed_score 是本项目为 siRNA-efficiency
+# 任务特意合并两个量级口径的混合指标：
+#
+# 该任务的 label 同时包含**分类语义**（值 1~30 = "有效"，>30 = "无效"）和
+# **连续语义**（值 0~150 是 siRNA knockdown efficiency 百分比）。
+# 单独报 F1 / 单独报 MAE都不够：F1 被阈值 30 变成"30 以下的精度"，丢失连续量级；
+# MAE 抹去分类语义时对几个少数超阈值的预测误差不敏感。
+#
+# mixed_score = (1 - mae/100) * 0.5  +  (1 - range_mae/100) * f1 * 0.5
+#
+#   term1 "1 - mae/100"      ：全局连续误差，归一化到 [0,1] 范围（mae/100 基准）。
+#                                取 100 而不是 1 是因为 MAE 在阈值以外可能 0-200，
+#                                设 100 能让原始 MAE 达到 100 (1.0 表达式归零)。
+#   term2 "1 - range_mae/100 * f1"：在 [0, threshold=30] 这个限阈区间的 MAE（被
+#                                该区间上 F1 加权后的 0-1 质量。
+#
+# 两项各 0.5 量级加权，**必须介于 [0,1]**。
+#
+# 【边界合理性】为什么各项会都 “min(_, 100)”？
+#   max_value=1e3、threshold=30 是 项目业务边界：sirna 预期在 [0, 150]，
+#   > 1e3 是明显错误预测要拦掉。MAE 超 100 是“无数强编码能力”的零分。
+# ============================================================================
 # Compute mixed score
 def compute_mixed_score(label_values, result_values, threshold=30, max_value=1e3):
     if len(result_values) == 0:
@@ -777,8 +802,25 @@ def compute_AUC_for_Modification_task(task_name, task_entries):
 # Modified from SaProt https://github.com/westlake-repl/SaProt/blob/main/utils/metrics.py
 def count_f1_max(pred, target):
     """
-    F1 score with the optimal threshold. 
+    F1 score with the optimal threshold.
     Handles cases where either predictions or targets are empty.
+
+    ============================================================================
+    【SaProt 经典 Fmax 算法】
+    ============================================================================
+    [设计动机] EC 任务是多项多标签 —— 个 protein 可能同属多个 EC 号码 (EC2.4.1.-)。
+    不同门槛 (threshold) 下 预测的 precision/recall 不同，源项目希望**报最优
+    门槛下的 max F1** 作为一个综合指标。
+
+    [机制] 按预测分数降序累加 top-K 个 protein，在 K=1..N 位置上算 (precision,
+    recall) 对，取 max(2*p*r/(p+r)) 作为 "Fmax"。这等于 "实例级最优 F1" 退化为
+    阈值问题，不占用指标台别的阈值。
+
+    【原 SaProt 中的复杂性】
+    本实现 中 一系列 0/1 跃迁遮蔽运算（is_start scatter）是为了并行化 多个
+    protein 在 不同排名位置上的 浮动阈值跳动。原项目不用这个， 别人不用该能
+    说得全。原 SinhighSaProt 原实现 重构后可读性低，但仅代以采样 重则 在
+    显卡上推进。
     
     Parameters:
         pred (Tensor): predictions of shape :math:`(B, N)`

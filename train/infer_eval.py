@@ -123,10 +123,18 @@ def main():
                     gen = model.generate(
                         **inputs,
                         max_new_tokens=args.max_new_tokens,
-                        do_sample=False,           # 贪婪解码，指标可复现
+                        # ============================================================================
+                        # 缓心解码 + 显式采样参数置 None（防御性）
+                        # ============================================================================
+                        # do_sample=False 是基座推理可复现的核心——产物随你跑多次都
+                        # 一样。如果不设，默认走 sampling，表里出现一个常见坑：Qwen
+                        # generation_config 里遗留 temperature=0.7/top_p=0.8/top_k=20，
+                        # 如果不显式置 None，HF 4.52+ 会报
+                        #   "temperature/top_p/top_k will be ignored  ... do_sample=False"
+                        # 这种 warning 本身只是警告、不会影响生成，但调阈值调到多头。
+                        # 显式设三个为 None 后是既警告取清、又是 严谨"贪心"语义。
+                        do_sample=False,
                         pad_token_id=tokenizer.pad_token_id,
-                        # 显式置 None，屏蔽 generation_config 里残留的 Qwen 默认采样参数
-                        # （否则会触发 "temperature/top_p/top_k 被忽略" 的 warning）
                         temperature=None,
                         top_p=None,
                         top_k=None,

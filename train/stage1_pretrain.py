@@ -35,11 +35,38 @@ from common import (ProgressCallback, add_common_args, add_lora, build_lora_plus
 
 
 def pack_texts(texts, tokenizer, max_len):
-    """把文本序列 token 化后拼成固定长度块（packing）。"""
+    """【自定义 packing】把独文本序列 token 化后拼成固定长度块。
+
+    ============================================================================
+    packing 在 stage1 里是核心优化：
+      - bio序列平均长度远小于 max_len（多数 50-200 bp vs max_len=2048）。
+      - 不 packing 时，批次里 70%是 pad 0 token（模型不学，但占计算量 70%）。
+      - packing 把多个独序列拼满 max_len 块 → **全部 token 都是监督信号**。
+      代价仅是“丢齄”几个 token（多个序列拼接处的隔断）。
+
+    而本实现三点反直觉设计需要注释：
+
+    [1] `max_length=max_len, truncation=False`：
+        看似"为什么传 max_length 但不 truncation"——这看起来是 bug，实则不是。
+        - `max_length=max_len` 仅仅是为了让 tokenizer **不报"超过 model_max_length 警告"**。
+          （Qwen2.5 默认 model_max_length=32768，远超样本，不限制反而会报上上游警告。）
+        - `truncation=False` 是设计要求：样本可能 >max_len（极个别长的），**后面
+          Python 切 max_len 块时会截除**；不在 tokenize 阶段截以避免：
+            (a) Qwen tokenizer 内部默认从中间截未个 caption 起算（不是末尾）；
+            (b) 双层截断与训练侧 labels mask 不一致。
+        选错在这里会遇到"训练看起来收敛但下游 eval 崩坏"的幽眼问题。
+
+    [2] 所有 sample token 拼成一个长序列（all_ids）再切 max_len 块，
+        不是循环 per-sample 看 〈len+拼》：上一个样本不会跟下一个样本拼接被 shield，
+        表征能里 token 预测下一个 token 是 8/7 合理的（不是有在联邦 分隔）。
+
+    [3] `blocks.append({"input_ids": block, "labels": block})`：labels = input_ids
+        （CLM 套路，人人都能输入 token 能预测同一 token）。
+        Pack 上没有 attention mask：所有块都能全 token 看见，这是 packing 的
+        **已知伪缺陷**（人人为对照乙序列 contamination 影响极小，论文如此设计）。
+    """
     all_ids = []
     for t in texts:
-        # max_length + truncation=False 抑制“超过 model_max_length 警告”——单文本可能 > max_len，
-        # 但 packing 后面会按 max_len 切块，不需要在 tokenize 阶段截断
         ids = tokenizer.encode(t, add_special_tokens=False, max_length=max_len, truncation=False)
         all_ids.extend(ids)
     blocks = []

@@ -58,6 +58,9 @@ from common import SYSTEM_PROMPT, add_common_args, load_model_tokenizer, read_js
 # 这些任务 label ∈ {positive, negative}，随机采样 50% 撞上 chosen 的标签；
 # 不加 <ans> 过滤则 DPO 损失 ≈ log2，对训练无信号。
 # regression / multiclass 任务天然区分度高，不需要这个过滤。
+#
+# 【跨脚本同步】这个列表与 stage2_sft.py task_kind() 里 BINARY_TASKS 同步。
+# 两处任意一边漏更新都会被 P0-1 过滤漏接，binary 任务上损失不收敛。
 BINARY_TASKS = frozenset({
     "rna_protein_interaction",
     "antibody_antigen",
@@ -185,8 +188,20 @@ def main():
         model, tokenizer = load_model_tokenizer(args.model_path, args.use_4bit, args.max_len)
         model = PeftModel.from_pretrained(model, args.stage2_dir)
         model.eval()
-        # 用左侧 padding：generate 时 batch 内 prompt 左对齐 padding，
-        # 这样每个样本的有效 token 都在右侧尾部，generation 一致；右侧 padding 会污染生成起点。
+        # ============================================================================
+        # 左侧 padding（Generation 场景的标准做法）
+        # ============================================================================
+        # 为什么必须 left padding 而不是 right：
+        #   - right padding 时，prompt 后填了 [pad, pad, ..., prompt, eos]
+        #     → 生成阶段从第一个 pad 开始计算，**前几个 attention 会扫 pad**，
+        #     起点位置在 KV cache 里是“中”间的，会污染首轮 attention 分数。
+        #   - left padding 让 prompt 都在右侧尾部（[..., prompt, eos]），
+        #     模型看到"上次生成位置"全部对齐为 "prompt[0]"，batch 内一致。
+        #
+        # 【后续 decode 时取 prompt 后的 token】
+        # `prompt_len = inputs["input_ids"].shape[1]` 是整个 batch 的 max prompt 长度
+        # （因为 left pad 所有样本都被填到同一长度）。这里所有样本判为同一 prompt_len
+        # 是 left padding 下的正确语义 。
         tokenizer.padding_side = "left"
         # 生成函数（HF 版本）：手动 batch + left-padding + model.generate()
         def _generate_batch(prompts):
