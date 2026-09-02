@@ -147,22 +147,54 @@ def compute_binary_class_weights(rows: list[dict]) -> dict[tuple[str, str], floa
 
 
 def encode_sft(item, tokenizer, max_len, system_prompt):
-    """编码为 (input_ids, labels)，assistant 部分才参与 loss。"""
+    """编码为 (input_ids, labels)，assistant 部分才参与 loss。
+
+    【重要修复】必须用 ``apply_chat_template(tokenize=True)`` 直接拿到 ChatML 完整 ids，
+    而不是先 string 再 ``tokenizer.encode()``——后者会把 ChatML 框架 token
+    (``<|im_start|>`` / ``<|im_end|>`` 等) 当作普通文本切分，让模型无法识别
+    prompt/response 边界，导致 ``model(input_ids)`` 看到的输入与训练时不匹配，
+    loss 在第一步后就掉到 ~0 (实际是模型在拟合被错位的 token)。
+
+    正确流程：
+      1. ``apply_chat_template(..., tokenize=True)`` 一次性拿到 ChatML 完整 ids
+      2. 手动截断到 ``max_len`` (apply_chat_template 的 truncation 参数在某些
+         transformers 版本里对 list-of-ints 不生效)
+      3. 用 prompt ids 的长度 mask 掉前 ``n_prompt`` 个 token 让 assistant
+         部分才贡献 loss
+    """
     msgs = [
         {"role": "system", "content": system_prompt},
         {"role": "user", "content": item["input"]},
         {"role": "assistant", "content": item["output"]},
     ]
-    full_text = tokenizer.apply_chat_template(msgs, tokenize=False, add_generation_prompt=False)
-    # prompt = system + user + assistant 头（不含 assistant 内容）
-    prompt_text = tokenizer.apply_chat_template(
-        msgs[:-1], tokenize=False, add_generation_prompt=True)
-    ids_full = tokenizer.encode(full_text, add_special_tokens=False, max_length=max_len, truncation=False)
-    ids_prompt = tokenizer.encode(prompt_text, add_special_tokens=False, max_length=max_len, truncation=False)
+    # 【修复】直接 tokenize=True,保留 ChatML 框架 token
+    ids_full = tokenizer.apply_chat_template(
+        msgs, tokenize=True, add_generation_prompt=False)
+    ids_prompt = tokenizer.apply_chat_template(
+        msgs[:-1], tokenize=True, add_generation_prompt=True)
 
-    # 截断保护
+    # 【修复】apply_chat_template 返回的可能不是纯 int 列表(老版本会包 list[list[int]])
+    # 统一展平成 List[int]
+    def _flatten(xs):
+        out = []
+        for x in xs:
+            if isinstance(x, (list, tuple)):
+                out.extend(_flatten(x))
+            else:
+                out.append(int(x))
+        return out
+
+    ids_full = _flatten(ids_full)
+    ids_prompt = _flatten(ids_prompt)
+
+    # 截断保护：硬截 max_len,但要确保不会把 <|im_end|> 中间切断
     if len(ids_full) > max_len:
         ids_full = ids_full[:max_len]
+        # 防御：如果末尾正好是 <|im_end|>(151645 for Qwen2.5)就保留，否则补一个
+        im_end_id = tokenizer.convert_tokens_to_ids("<|im_end|>")
+        if im_end_id is not None and im_end_id != tokenizer.unk_token_id \
+                and ids_full[-1] != im_end_id:
+            ids_full[-1] = im_end_id
     n_prompt = min(len(ids_prompt), len(ids_full))
     labels = [-100] * n_prompt + ids_full[n_prompt:]
     return {"input_ids": ids_full, "labels": labels}
