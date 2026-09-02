@@ -16,6 +16,10 @@
 #
 #   SKIP_CLONE=1 bash run.sh stage1            跳过顶部 git clone(代码已最新时更快)
 #
+# 路径说明: CODE_DIR/MODEL_7B/DATA_DIR/OUT_DIR 默认取运行脚本时的工作目录(pwd),
+#           即 $PWD/bio-align、$PWD/Qwen2.5-7B-Instruct、$PWD/input_data、$PWD/output;
+#           需要改路径时直接改下面的 ADB_PATH 变量
+#
 # stage 命令终端立即返回 PID 与日志文件, 训练/推理/评测全写进同一份日志,
 # 用 tail -f 查看进度; 训练失败时自动中止, 不会继续推理评测
 # =============================================================================
@@ -26,7 +30,7 @@ if [ "$SKIP_CLONE" != "1" ]; then
   git clone https://gitee.com/kip_LS/bio-align.git
 fi
 
-ADB_PATH="/"
+ADB_PATH="$(pwd)"   # 默认取运行脚本时的工作目录(非脚本所在目录); 可改成自己的路径
 CODE_DIR="$ADB_PATH/bio-align"
 MODEL_7B="$ADB_PATH/Qwen2.5-7B-Instruct"
 DATA_DIR="$ADB_PATH/input_data"
