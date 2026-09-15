@@ -239,12 +239,34 @@ class WeightedSFTTrainer(Trainer):
         labels = inputs.get("labels")
         outputs = model(**inputs)
         logits = outputs.logits
+
+        # ============================================================================
+        # 【重要】shift labels 以匹配自回归预测
+        # ============================================================================
+        # 因果语言模型约定：logits[:, t, :] 预测的是 "位置 t+1 应该是哪个 token"。
+        # 所以要算 CE loss 必须把 labels 右移一位 (即 labels[:, 1:])，并把
+        # logits 最后一帧丢掉 (即 logits[:, :-1, :])。
+        #
+        # 历史 bug（commit 281c074 引入）：旧版 `WeightedSFTTrainer.compute_loss`
+        # 直接用 `logits` vs `labels`（不 shift），结果是 logits[t] 在预测
+        # labels[t]（即 input_ids[t] 本身），CE loss 永远接近 0。模型没在
+        # "根据上文预测下一 token" 上学到任何东西，LoRA 矩阵在弱梯度噪声
+        # 下漂移到 next-token logits 偏向 \n，推理时输出连续 \n 串，strip 后
+        # 是空字符串。
+        #
+        # HF 默认 `Trainer.compute_loss` 走 `self.label_smoother(..., shift_labels=True)`
+        # 会自动 shift；自定义 compute_loss 必须自己 shift，否则就是"模型在
+        # 复述输入"的虚假收敛。
+        # ============================================================================
+        shift_logits = logits[:, :-1, :].contiguous()
+        shift_labels = labels[:, 1:].contiguous()
+
         if weights is None:
-            # 未启用 task weights 时的标准 CE 路径——走 cross_entropy 的
-            # 默认 reduction="mean"，等价于在所有非 -100 token 上取平均。
+            # 未启用 task weights 时的标准 CE 路径——等价于 HF Trainer 默认行为
+            # （shift_labels=True 之后 cross_entropy reduction="mean"）。
             loss = torch.nn.functional.cross_entropy(
-                logits.view(-1, logits.size(-1)),
-                labels.view(-1),
+                shift_logits.view(-1, shift_logits.size(-1)),
+                shift_labels.view(-1),
                 ignore_index=-100,
             )
         else:
@@ -252,21 +274,21 @@ class WeightedSFTTrainer(Trainer):
             # per-sample 加权 loss 三阶段流程
             # ============================================================================
             # [Stage A] per-token CE，reduction="none" 跳出默认的 mean 归约；
-            #           形状 (B, T)，保留每个 (b, t) 的独立 CE 值。
-            # [Stage B] per-sample 平均：在每个 b 上把 loss × (labels != -100) 抹
+            #           形状 (B, T-1)，保留每个 (b, t) 的独立 CE 值。
+            # [Stage B] per-sample 平均：在每个 b 上把 loss × (shift_labels != -100) 抹
             #           掉 padding / 不了 token 位置，再对 t 求和 / token_cnt。
             #           得到 (B,) 的 per_sample loss  —— 与 batch 里 token 数
             #           不同无关，完全对齐"一个样本一个 loss”的语义。
-            # [Stage C] per-sample weight 加权：太鲁棒太鲁棒的 mean(weight)=1
+            # [Stage C] per-sample weight 加权：mean(weight)=1
             #           归一化是为了严格退回为 mean(per_sample)，与未加权时
             #           同量级。
             losses = torch.nn.functional.cross_entropy(
-                logits.view(-1, logits.size(-1)),
-                labels.view(-1),
+                shift_logits.view(-1, shift_logits.size(-1)),
+                shift_labels.view(-1),
                 ignore_index=-100,
                 reduction="none",
-            ).view(labels.shape)
-            mask = (labels != -100).float()
+            ).view(shift_labels.shape)
+            mask = (shift_labels != -100).float()
             token_cnt = mask.sum(dim=-1).clamp_min(1.0)
             per_sample = (losses * mask).sum(dim=-1) / token_cnt
             w = weights.to(per_sample.device).to(per_sample.dtype)
